@@ -2,11 +2,7 @@ import 'dart:async';
 
 import 'package:web_socket_channel/io.dart';
 
-enum SocketStatus {
-  connected,
-  failed,
-  closed,
-}
+enum SocketStatus { connecting, connected, failed, closed }
 
 class WebScoketUtils {
   SocketStatus status = SocketStatus.closed;
@@ -58,24 +54,37 @@ class WebScoketUtils {
   /// 最大重连次数
   int maxReconnectTime = 5;
 
+  /// 用于忽略已被关闭或替换的异步连接结果
+  int _connectionGeneration = 0;
+
   StreamSubscription<dynamic>? streamSubscription;
 
   void connect({bool retry = false}) async {
     close();
+    status = SocketStatus.connecting;
+    final connectionGeneration = _connectionGeneration;
     try {
       var wsurl = url;
       if (backupUrl != null && backupUrl!.isNotEmpty && retry) {
         wsurl = backupUrl!;
       }
-      webSocket = IOWebSocketChannel.connect(
+      final channel = IOWebSocketChannel.connect(
         wsurl,
         connectTimeout: Duration(seconds: 10),
         headers: headers,
       );
+      webSocket = channel;
 
-      await webSocket?.ready;
+      await channel.ready;
+      if (connectionGeneration != _connectionGeneration) {
+        await channel.sink.close();
+        return;
+      }
       ready();
     } catch (e) {
+      if (connectionGeneration != _connectionGeneration) {
+        return;
+      }
       if (!retry) {
         connect(retry: true);
         return;
@@ -99,12 +108,11 @@ class WebScoketUtils {
   }
 
   void initHeartBeat() {
-    heartBeatTimer = Timer.periodic(
-      Duration(milliseconds: heartBeatTime),
-      (timer) {
-        onHeartBeat?.call();
-      },
-    );
+    heartBeatTimer = Timer.periodic(Duration(milliseconds: heartBeatTime), (
+      timer,
+    ) {
+      onHeartBeat?.call();
+    });
   }
 
   void receiveMessage(dynamic data) {
@@ -114,8 +122,12 @@ class WebScoketUtils {
   }
 
   void onError(e, s) {
+    if (status == SocketStatus.closed) {
+      return;
+    }
     status = SocketStatus.failed;
     onClose?.call(e.toString());
+    reconnect();
   }
 
   void onDone() {
@@ -133,14 +145,17 @@ class WebScoketUtils {
   }
 
   void close() {
+    _connectionGeneration++;
     status = SocketStatus.closed;
 
     streamSubscription?.cancel();
+    streamSubscription = null;
 
     reconnectTimer?.cancel();
     reconnectTimer = null;
 
     webSocket?.sink.close();
+    webSocket = null;
 
     heartBeatTimer?.cancel();
     heartBeatTimer = null;
@@ -150,7 +165,9 @@ class WebScoketUtils {
     status = SocketStatus.closed;
     if (reconnectTime < maxReconnectTime) {
       reconnectTime++;
-      reconnectTimer ??= Timer.periodic(Duration(seconds: 5), (timer) {
+      reconnectTimer?.cancel();
+      reconnectTimer = Timer(const Duration(seconds: 5), () {
+        reconnectTimer = null;
         connect();
       });
     } else {

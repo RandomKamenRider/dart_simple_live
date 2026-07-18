@@ -68,31 +68,55 @@ class DouyinSite implements LiveSite {
   Future<List<LiveCategory>> getCategores() async {
     List<LiveCategory> categories = [];
     var result = await HttpClient.instance.getText(
-      "https://live.douyin.com/",
+      "https://live.douyin.com/categorynew/4_101",
       queryParameters: {},
       header: await getRequestHeaders(),
     );
 
-    var renderData =
-        RegExp(
-          r'\{\\"pathname\\":\\"\/\\",\\"categoryData.*?\]\\n',
-        ).firstMatch(result)?.group(0) ??
-        "";
-    var renderDataJson = json.decode(
-      renderData
-          .trim()
-          .replaceAll('\\"', '"')
-          .replaceAll(r"\\", r"\")
-          .replaceAll(']\\n', ""),
-    );
+    final renderDataJson = _parseCategoryDataFromHtml(result);
+    final categoryData = renderDataJson["categoryData"];
+    if (categoryData is! List) {
+      throw const FormatException("抖音分类页面中的 categoryData 不是列表");
+    }
 
-    for (var item in renderDataJson["categoryData"]) {
+    for (final rawItem in categoryData) {
+      if (rawItem is! Map) {
+        continue;
+      }
+      final item = Map<String, dynamic>.from(rawItem);
+      final rawPartition = item["partition"];
+      if (rawPartition is! Map) {
+        continue;
+      }
+      final partition = Map<String, dynamic>.from(rawPartition);
+      final partitionId = partition["id_str"]?.toString() ?? "";
+      final partitionType = partition["type"]?.toString() ?? "";
+      if (partitionId.isEmpty || partitionType.isEmpty) {
+        continue;
+      }
+
       List<LiveSubCategory> subs = [];
-      var id = '${item["partition"]["id_str"]},${item["partition"]["type"]}';
-      for (var subItem in item["sub_partition"]) {
+      var id = "$partitionId,$partitionType";
+      final subPartitions = item["sub_partition"];
+      for (final rawSubItem in subPartitions is List ? subPartitions : []) {
+        if (rawSubItem is! Map) {
+          continue;
+        }
+        final subItem = Map<String, dynamic>.from(rawSubItem);
+        final rawSubPartition = subItem["partition"];
+        if (rawSubPartition is! Map) {
+          continue;
+        }
+        final subPartition = Map<String, dynamic>.from(rawSubPartition);
+        final subPartitionId = subPartition["id_str"]?.toString() ?? "";
+        final subPartitionType = subPartition["type"]?.toString() ?? "";
+        if (subPartitionId.isEmpty || subPartitionType.isEmpty) {
+          continue;
+        }
+
         var subCategory = LiveSubCategory(
-          id: '${subItem["partition"]["id_str"]},${subItem["partition"]["type"]}',
-          name: asT<String?>(subItem["partition"]["title"]) ?? "",
+          id: "$subPartitionId,$subPartitionType",
+          name: asT<String?>(subPartition["title"]) ?? "",
           parentId: id,
           pic: "",
         );
@@ -102,7 +126,7 @@ class DouyinSite implements LiveSite {
       var category = LiveCategory(
         children: subs,
         id: id,
-        name: asT<String?>(item["partition"]["title"]) ?? "",
+        name: asT<String?>(partition["title"]) ?? "",
       );
       subs.insert(
         0,
@@ -115,7 +139,96 @@ class DouyinSite implements LiveSite {
       );
       categories.add(category);
     }
+    if (categories.isEmpty) {
+      throw const FormatException("抖音分类页面未返回有效分类");
+    }
     return categories;
+  }
+
+  /// 从抖音页面的 React Flight 数据中读取分类数据。
+  Map<String, dynamic> _parseCategoryDataFromHtml(String html) {
+    final payloadPattern = RegExp(
+      r'''self\.__pace_f\.push\(\[\d+,\s*("(?:\\.|[^"\\])*")\]\)''',
+      dotAll: true,
+    );
+
+    for (final match in payloadPattern.allMatches(html)) {
+      final encodedPayload = match.group(1);
+      if (encodedPayload == null) {
+        continue;
+      }
+
+      String payload;
+      try {
+        final decodedPayload = json.decode(encodedPayload);
+        if (decodedPayload is! String) {
+          continue;
+        }
+        payload = decodedPayload;
+      } on FormatException {
+        continue;
+      }
+
+      for (final line in const LineSplitter().convert(payload)) {
+        final jsonFragment = _extractJsonFragment(line);
+        if (jsonFragment == null || !jsonFragment.contains('"categoryData"')) {
+          continue;
+        }
+
+        try {
+          final decodedFragment = json.decode(jsonFragment);
+          final categoryContainer = _findCategoryContainer(decodedFragment);
+          if (categoryContainer != null) {
+            return categoryContainer;
+          }
+        } on FormatException {
+          continue;
+        }
+      }
+    }
+
+    throw const FormatException("抖音分类页面中未找到有效的 categoryData");
+  }
+
+  String? _extractJsonFragment(String value) {
+    final objectStart = value.indexOf("{");
+    final arrayStart = value.indexOf("[");
+    final starts = [objectStart, arrayStart].where((index) => index >= 0);
+    if (starts.isEmpty) {
+      return null;
+    }
+
+    final start = starts.reduce((left, right) => left < right ? left : right);
+    final end = [value.lastIndexOf("}"), value.lastIndexOf("]")]
+        .where((index) => index >= start)
+        .fold<int>(-1, (current, index) => index > current ? index : current);
+    if (end < start) {
+      return null;
+    }
+    return value.substring(start, end + 1);
+  }
+
+  Map<String, dynamic>? _findCategoryContainer(dynamic value) {
+    if (value is Map) {
+      final map = Map<String, dynamic>.from(value);
+      if (map["categoryData"] is List) {
+        return map;
+      }
+      for (final child in map.values) {
+        final result = _findCategoryContainer(child);
+        if (result != null) {
+          return result;
+        }
+      }
+    } else if (value is List) {
+      for (final child in value) {
+        final result = _findCategoryContainer(child);
+        if (result != null) {
+          return result;
+        }
+      }
+    }
+    return null;
   }
 
   @override

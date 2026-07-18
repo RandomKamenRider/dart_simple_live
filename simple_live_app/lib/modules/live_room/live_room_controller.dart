@@ -99,6 +99,16 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   /// 是否处于后台
   var isBackground = false;
 
+  /// 进入后台的时间点，用于判断返回前台后是否需要重新拉流
+  DateTime? _enterBackgroundTime;
+
+  /// 返回前台后，后台停留超过该时长则强制重新拉取直播流
+  /// 直播地址通常带有时效签名，长时间挂后台后旧连接会失效或落后于真实进度
+  static const Duration _backgroundReloadThreshold = Duration(seconds: 5);
+
+  /// 返回前台后延迟重连弹幕，等待 Android 网络与 DNS 恢复
+  Timer? _danmakuResumeTimer;
+
   /// 直播间加载失败
   var loadError = false.obs;
   Error? error;
@@ -389,7 +399,11 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     return qualityLevel;
   }
 
-  void getPlayUrl() async {
+  /// 获取播放地址并初始化播放列表。
+  ///
+  /// [resetRetryCount] 为 true 时重置错误重试计数（正常首播/切清晰度场景）；
+  /// 由错误重试触发时应传 false，以保留计数，避免陷入无限重试而无法切换线路。
+  void getPlayUrl({bool resetRetryCount = true}) async {
     playUrls.clear();
     currentQualityInfo.value = qualites[currentQuality].quality;
     currentLineInfo.value = "";
@@ -404,8 +418,10 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     playHeaders = playUrl.headers;
     currentLineIndex = 0;
     currentLineInfo.value = "线路${currentLineIndex + 1}";
-    //重置错误次数
-    mediaErrorRetryCount = 0;
+    if (resetRetryCount) {
+      //重置错误次数
+      mediaErrorRetryCount = 0;
+    }
     initPlaylist();
   }
 
@@ -451,8 +467,8 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         await Future.delayed(const Duration(seconds: 1));
       }
       mediaErrorRetryCount += 1;
-      //刷新一次
-      setPlayer();
+      //重新拉取播放地址后再刷新，避免复用已失效或过期的直播地址
+      retryPlay();
       return;
     }
 
@@ -470,7 +486,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   int mediaErrorRetryCount = 0;
   @override
   void mediaError(String error) async {
-    super.mediaEnd();
+    super.mediaError(error);
     if (mediaErrorRetryCount < 2) {
       Log.d("播放失败，尝试第${mediaErrorRetryCount + 1}次刷新");
       if (mediaErrorRetryCount == 1) {
@@ -478,8 +494,8 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         await Future.delayed(const Duration(seconds: 1));
       }
       mediaErrorRetryCount += 1;
-      //刷新一次
-      setPlayer();
+      //重新拉取播放地址后再刷新，避免复用已失效或过期的直播地址
+      retryPlay();
       return;
     }
 
@@ -490,6 +506,18 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       //currentLineIndex += 1;
       //setPlayer();
       changePlayLine(currentLineIndex + 1);
+    }
+  }
+
+  /// 播放结束/失败时的重试。
+  ///
+  /// 优先重新向站点请求当前清晰度的播放地址，用新地址重开播放器；
+  /// 若房间信息缺失则退化为在现有地址上重连，保证兜底能力。
+  void retryPlay() {
+    if (detail.value != null && liveStatus.value) {
+      getPlayUrl(resetRetryCount: false);
+    } else {
+      setPlayer();
     }
   }
 
@@ -1012,11 +1040,93 @@ ${error?.stackTrace}''');
       //进入后台，关闭弹幕
       danmakuController?.clear();
       isBackground = true;
+      _enterBackgroundTime = DateTime.now();
+      _danmakuResumeTimer?.cancel();
+      _danmakuResumeTimer = null;
+      unawaited(liveDanmaku.stop());
     } else
     //返回前台
     if (state == AppLifecycleState.resumed) {
       Log.d("返回前台");
       isBackground = false;
+      // canvas_danmaku 进入后台时会暂停内部渲染，返回前台后不会自动恢复。
+      danmakuController?.resume();
+      _restartDanmakuAfterResume();
+      _handleResumeFromBackground();
+    }
+  }
+
+  /// 返回前台后重建弹幕连接。
+  ///
+  /// Android 从后台恢复时网络与 DNS 可能尚未就绪，因此延迟一次连接；
+  /// 若期间再次进入后台，则取消本次恢复，避免后台持续重连。
+  void _restartDanmakuAfterResume() {
+    _danmakuResumeTimer?.cancel();
+    if (!liveStatus.value || detail.value == null) {
+      return;
+    }
+
+    _danmakuResumeTimer = Timer(const Duration(seconds: 1), () async {
+      _danmakuResumeTimer = null;
+      if (isBackground || !liveStatus.value || detail.value == null) {
+        return;
+      }
+
+      try {
+        await liveDanmaku.stop();
+        if (isBackground) {
+          return;
+        }
+        initDanmau();
+        addSysMsg("正在重新连接弹幕服务器");
+        await liveDanmaku.start(detail.value?.danmakuData);
+      } catch (error) {
+        Log.logPrint(error);
+        onWSClose("弹幕服务器重连失败：$error");
+      }
+    });
+  }
+
+  /// 返回前台后处理直播流恢复。
+  ///
+  /// 直播地址带有时效签名，App 挂后台期间连接可能被系统挂起或地址失效，
+  /// 播放器若继续使用旧连接会停留在过期缓冲、落后于真实直播进度，
+  /// 表现为画面卡住或视频流被截断。因此后台停留超过阈值时重新拉取播放地址并重开播放器。
+  void _handleResumeFromBackground() {
+    final enterTime = _enterBackgroundTime;
+    _enterBackgroundTime = null;
+
+    // 仅在直播中才需要重新拉流；录像/未开播无需处理
+    if (!liveStatus.value) {
+      return;
+    }
+    if (enterTime == null) {
+      return;
+    }
+
+    final backgroundDuration = DateTime.now().difference(enterTime);
+    if (backgroundDuration < _backgroundReloadThreshold) {
+      return;
+    }
+
+    Log.d("后台停留${backgroundDuration.inSeconds}秒，重新拉取直播流");
+    reloadStream();
+  }
+
+  /// 重新拉取直播地址并重开播放器，用于追赶直播真实进度。
+  ///
+  /// 与 [refreshRoom] 不同，此方法不重连弹幕、不重新拉取房间详情，
+  /// 仅在已有房间信息的基础上重新获取播放地址，尽量减少对已有连接的干扰。
+  void reloadStream() {
+    if (detail.value == null || !liveStatus.value) {
+      return;
+    }
+    mediaErrorRetryCount = 0;
+    if (qualites.isEmpty || currentQuality < 0) {
+      // 尚未成功获取过清晰度时，走完整的清晰度+地址获取流程
+      getPlayQualites();
+    } else {
+      getPlayUrl();
     }
   }
 
@@ -1057,6 +1167,8 @@ ${error?.stackTrace}''');
     scrollController.removeListener(scrollListener);
     autoExitTimer?.cancel();
 
+    _danmakuResumeTimer?.cancel();
+    _danmakuResumeTimer = null;
     liveDanmaku.stop();
     danmakuController = null;
     _liveDurationTimer?.cancel(); // 页面关闭时取消定时器
