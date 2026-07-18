@@ -1,5 +1,16 @@
 allprojects {
     repositories {
+        maven {
+            url = uri("https://maven.aliyun.com/repository/google")
+        }
+        maven {
+            url = uri("https://maven.aliyun.com/repository/central")
+        }
+        maven {
+            url = uri("https://maven.aliyun.com/repository/public")
+        }
+
+        // 镜像缺少包时回退
         google()
         mavenCentral()
     }

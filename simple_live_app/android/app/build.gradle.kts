@@ -30,7 +30,7 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.xycz.simple_live"
+        applicationId = "com.wind.elite_live"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -40,20 +40,46 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["keyPassword"] as String
-            storeFile = keystoreProperties["storeFile"]?.let { file(it) }
-            storePassword = keystoreProperties["storePassword"] as String
-            isV1SigningEnabled = true
-            isV2SigningEnabled = true
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                keyAlias = requireNotNull(
+                    keystoreProperties.getProperty("keyAlias"),
+                ) {
+                    "Missing keyAlias in key.properties"
+                }
+                keyPassword = requireNotNull(
+                    keystoreProperties.getProperty("keyPassword"),
+                ) {
+                    "Missing keyPassword in key.properties"
+                }
+                storeFile = file(
+                    requireNotNull(
+                        keystoreProperties.getProperty("storeFile"),
+                    ) {
+                        "Missing storeFile in key.properties"
+                    },
+                )
+                storePassword = requireNotNull(
+                    keystoreProperties.getProperty("storePassword"),
+                ) {
+                    "Missing storePassword in key.properties"
+                }
+                isV1SigningEnabled = true
+                isV2SigningEnabled = true
+            }
         }
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
+
         release {
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("release")
+            signingConfigs.findByName("release")?.let {
+                signingConfig = it
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(

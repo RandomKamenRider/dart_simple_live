@@ -108,7 +108,7 @@ Future initWindow() async {
   WindowOptions windowOptions = const WindowOptions(
     minimumSize: Size(280, 280),
     center: true,
-    title: "Simple Live",
+    title: "Elite Live",
   );
   windowManager.waitUntilReadyToShow(windowOptions, () async {
     await windowManager.show();
@@ -189,7 +189,7 @@ class MyApp extends StatelessWidget {
             seedColor: styleColor, brightness: Brightness.dark);
       }
       return GetMaterialApp(
-        title: "Simple Live",
+        title: "Elite Live",
         theme: AppStyle.lightTheme.copyWith(colorScheme: lightColorScheme),
         darkTheme: AppStyle.darkTheme.copyWith(colorScheme: darkColorScheme),
         themeMode:

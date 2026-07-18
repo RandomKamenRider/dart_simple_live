@@ -29,7 +29,7 @@ mixin PlayerMixin {
   /// 播放器实例
   late final player = Player(
     configuration: PlayerConfiguration(
-      title: "Simple Live Player",
+      title: "Elite Live",
       logLevel: AppSettingsController.instance.logEnable.value
           ? MPVLogLevel.info
           : MPVLogLevel.error,
