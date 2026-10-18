@@ -124,6 +124,29 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   bool _resumeStreamPending = false;
   int? _pendingPlaybackFailureGeneration;
   String? _pendingPlaybackError;
+  Timer? _playbackErrorTimer;
+  Completer<void>? _playbackErrorCheck;
+  Timer? _streamReconnectTimer;
+  int _streamReconnectAttempt = 0;
+
+  void _cancelPlaybackErrorCheck() {
+    _playbackErrorTimer?.cancel();
+    _playbackErrorTimer = null;
+    final check = _playbackErrorCheck;
+    _playbackErrorCheck = null;
+    if (check != null && !check.isCompleted) {
+      check.complete();
+    }
+  }
+
+  void _cancelPlaybackRecovery({bool resetBackoff = true}) {
+    _cancelPlaybackErrorCheck();
+    _streamReconnectTimer?.cancel();
+    _streamReconnectTimer = null;
+    if (resetBackoff) {
+      _streamReconnectAttempt = 0;
+    }
+  }
 
   bool get _isChangingStream =>
       _streamLoadGeneration == _streamOperationGeneration ||
@@ -311,6 +334,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
   /// 加载直播间信息
   Future<void> loadData() async {
+    _cancelPlaybackRecovery();
     final generation = ++_streamOperationGeneration;
     _streamLoadGeneration = generation;
     _playbackStableTimer?.cancel();
@@ -398,7 +422,15 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   }
 
   /// 初始化播放器
-  Future<void> getPlayQualites({int? operationGeneration}) async {
+  Future<void> getPlayQualites({
+    int? operationGeneration,
+    bool preserveQuality = false,
+    bool preserveLine = false,
+    bool resetRetryCount = true,
+  }) async {
+    if (operationGeneration == null) {
+      _cancelPlaybackRecovery();
+    }
     final generation = operationGeneration ?? ++_streamOperationGeneration;
     if (!_isStreamOperationCurrent(generation)) {
       return;
@@ -407,6 +439,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       _streamLoadGeneration = generation;
     }
     _playbackStableTimer?.cancel();
+    final selectedQuality = currentQualityInfo.value;
 
     try {
       var playQualites =
@@ -423,7 +456,12 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         return;
       }
       qualites.value = playQualites;
-      if (qualityLevel == 2) {
+      final selectedIndex = preserveQuality
+          ? playQualites.indexWhere((item) => item.quality == selectedQuality)
+          : -1;
+      if (selectedIndex >= 0) {
+        currentQuality = selectedIndex;
+      } else if (qualityLevel == 2) {
         //最高
         currentQuality = 0;
       } else if (qualityLevel == 0) {
@@ -435,7 +473,11 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         currentQuality = middle;
       }
 
-      await getPlayUrl(operationGeneration: generation);
+      await getPlayUrl(
+        operationGeneration: generation,
+        resetRetryCount: resetRetryCount,
+        preserveLine: preserveLine,
+      );
     } catch (e) {
       if (!_isStreamOperationCurrent(generation)) {
         return;
@@ -477,6 +519,9 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     int? operationGeneration,
     bool preserveLine = false,
   }) async {
+    if (operationGeneration == null) {
+      _cancelPlaybackRecovery();
+    }
     final generation = operationGeneration ?? ++_streamOperationGeneration;
     if (!_isStreamOperationCurrent(generation) ||
         detail.value == null ||
@@ -529,11 +574,17 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     }
   }
 
-  Future<void> changePlayLine(int index) async {
+  Future<void> changePlayLine(int index, {int? operationGeneration}) async {
     if (index < 0 || index >= playUrls.length) {
       return;
     }
-    final generation = ++_streamOperationGeneration;
+    if (operationGeneration == null) {
+      _cancelPlaybackRecovery();
+    }
+    final generation = operationGeneration ?? ++_streamOperationGeneration;
+    if (!_isStreamOperationCurrent(generation)) {
+      return;
+    }
     _streamLoadGeneration = generation;
     _playbackStableTimer?.cancel();
     currentLineIndex = index;
@@ -542,6 +593,9 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     try {
       await initPlaylist(operationGeneration: generation);
     } catch (failure) {
+      if (operationGeneration != null) {
+        rethrow;
+      }
       if (_isStreamOperationCurrent(generation)) {
         Log.logPrint(failure);
         errorMsg.value = "切换线路失败，请刷新重试";
@@ -577,10 +631,6 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
     // 各线路是同一直播的备用地址，由控制器统一重试和切换。
     await player.open(Media(url, httpHeaders: playHeaders));
-    if (_isStreamOperationCurrent(operationGeneration) &&
-        !player.state.playing) {
-      await player.play();
-    }
   }
 
   Future<void> setPlayer() async {
@@ -594,19 +644,95 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   }
 
   @override
-  Future<void> mediaEnd() => _recoverPlayback();
+  Future<void> mediaEnd() async {
+    // completed 流可能仍在派发旧连接事件，以播放器的当前状态为准。
+    if (player.state.completed) {
+      _cancelPlaybackErrorCheck();
+      await _recoverPlayback();
+    }
+  }
 
   int mediaErrorRetryCount = 0;
   @override
-  Future<void> mediaError(String error) => _recoverPlayback(error: error);
+  Future<void> mediaError(String error) {
+    if (isClosed || !liveStatus.value) {
+      return Future<void>.value();
+    }
+    if (_isChangingStream || player.state.completed) {
+      return _recoverPlayback(error: error);
+    }
+    if (isBackground) {
+      _resumeStreamPending = true;
+      return Future<void>.value();
+    }
+    if (!player.state.playing && !player.state.buffering) {
+      return Future<void>.value();
+    }
+    final existingCheck = _playbackErrorCheck;
+    if (existingCheck != null) {
+      return existingCheck.future;
+    }
+
+    // media_kit 将部分 mpv 日志也发到 error 流，只有停止推进时才重连。
+    final generation = _streamOperationGeneration;
+    var position = player.state.position;
+    var stalledChecks = 0;
+    var advancingChecks = 0;
+    final check = Completer<void>();
+    _playbackErrorCheck = check;
+    _playbackErrorTimer =
+        Timer.periodic(const Duration(seconds: 1), (timer) async {
+      if (!_isStreamOperationCurrent(generation) ||
+          !liveStatus.value ||
+          (!player.state.completed &&
+              !player.state.playing &&
+              !player.state.buffering)) {
+        _cancelPlaybackErrorCheck();
+        return;
+      }
+      if (player.state.position != position) {
+        position = player.state.position;
+        stalledChecks = 0;
+        advancingChecks += 1;
+      } else {
+        stalledChecks += 1;
+        advancingChecks = 0;
+      }
+      if (!player.state.completed && stalledChecks < 5 && advancingChecks < 5) {
+        return;
+      }
+      timer.cancel();
+      _playbackErrorTimer = null;
+      _playbackErrorCheck = null;
+      try {
+        if (player.state.completed || stalledChecks >= 5) {
+          Log.d("错误日志后播放连续5秒未推进，开始恢复：$error");
+          await _recoverPlayback(error: error);
+        } else {
+          Log.d("错误日志后播放持续推进，保留当前连接：$error");
+        }
+      } finally {
+        if (!check.isCompleted) {
+          check.complete();
+        }
+      }
+    });
+    return check.future;
+  }
 
   Future<void> _recoverPlayback({String? error}) async {
     if (isClosed || !liveStatus.value) {
       return;
     }
+    if (_streamReconnectTimer != null) {
+      return;
+    }
     if (_isChangingStream) {
+      if (_pendingPlaybackFailureGeneration != _streamOperationGeneration) {
+        _pendingPlaybackError = null;
+      }
       _pendingPlaybackFailureGeneration = _streamOperationGeneration;
-      _pendingPlaybackError = error;
+      _pendingPlaybackError ??= error;
       return;
     }
     _playbackStableTimer?.cancel();
@@ -614,6 +740,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       _resumeStreamPending = true;
       return;
     }
+    _cancelPlaybackErrorCheck();
     final generation = ++_streamOperationGeneration;
     _mediaRecoveryGeneration = generation;
     try {
@@ -626,50 +753,25 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         if (!_isStreamOperationCurrent(generation)) {
           return;
         }
-        try {
-          await getPlayUrl(
-            resetRetryCount: false,
-            operationGeneration: generation,
-            preserveLine: true,
-          );
-        } catch (failure) {
-          if (!_isStreamOperationCurrent(generation)) {
-            return;
-          }
-          if (currentLineIndex < 0 || currentLineIndex >= playUrls.length) {
-            rethrow;
-          }
-          Log.d("刷新地址失败，尝试重连现有线路：$failure");
+        if (mediaErrorRetryCount == 1 &&
+            currentLineIndex >= 0 &&
+            currentLineIndex < playUrls.length) {
           await initPlaylist(operationGeneration: generation);
+        } else {
+          await _refreshPlaybackData(generation, preserveLine: true);
         }
       } else if (currentLineIndex >= 0 &&
           currentLineIndex + 1 < playUrls.length) {
-        await changePlayLine(currentLineIndex + 1);
+        await changePlayLine(currentLineIndex + 1,
+            operationGeneration: generation);
       } else {
-        // 播放连接结束并不能证明主播下播，必须向平台确认状态。
-        final refreshedDetail =
-            await site.liveSite.getRoomDetail(roomId: roomId);
-        if (!_isStreamOperationCurrent(generation)) {
-          return;
-        }
-        detail.value = refreshedDetail;
-        online.value = refreshedDetail.online;
-        if (!refreshedDetail.status && !refreshedDetail.isRecord) {
-          liveStatus.value = false;
-          startLiveDurationTimer();
-          await player.stop();
-          if (_isStreamOperationCurrent(generation)) {
-            await WakelockPlus.disable();
-          }
-        } else {
-          errorMsg.value = "直播流已断开，请刷新重试";
-        }
+        _scheduleStreamReconnect(generation);
       }
     } catch (failure) {
       if (_isStreamOperationCurrent(generation)) {
         Log.logPrint(failure);
-        errorMsg.value = "恢复播放失败，请刷新重试";
         addSysMsg("恢复播放失败：$failure");
+        _scheduleStreamReconnect(generation);
       }
     } finally {
       if (_mediaRecoveryGeneration == generation) {
@@ -684,6 +786,64 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _refreshPlaybackData(int generation,
+      {bool preserveLine = false}) async {
+    final refreshedDetail = await site.liveSite.getRoomDetail(roomId: roomId);
+    if (!_isStreamOperationCurrent(generation)) {
+      return;
+    }
+    detail.value = refreshedDetail;
+    online.value = refreshedDetail.online;
+    liveStatus.value = refreshedDetail.status || refreshedDetail.isRecord;
+    startLiveDurationTimer();
+    if (!liveStatus.value) {
+      await player.stop();
+      if (_isStreamOperationCurrent(generation)) {
+        await WakelockPlus.disable();
+      }
+      return;
+    }
+    await getPlayQualites(
+      operationGeneration: generation,
+      preserveQuality: true,
+      preserveLine: preserveLine,
+      resetRetryCount: false,
+    );
+  }
+
+  void _scheduleStreamReconnect(int generation) {
+    if (!_isStreamOperationCurrent(generation) ||
+        !liveStatus.value ||
+        _streamReconnectTimer != null) {
+      return;
+    }
+    final delaySeconds = 2 << _streamReconnectAttempt.clamp(0, 4);
+    _streamReconnectAttempt += 1;
+    errorMsg.value = "直播连接中断，正在重新连接";
+    Log.d("直播流将在$delaySeconds 秒后重新获取房间和播放数据");
+    _streamReconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
+      _streamReconnectTimer = null;
+      if (!_isStreamOperationCurrent(generation)) {
+        return;
+      }
+      final reconnectGeneration = ++_streamOperationGeneration;
+      _mediaRecoveryGeneration = reconnectGeneration;
+      try {
+        await _refreshPlaybackData(reconnectGeneration);
+      } catch (failure) {
+        if (_isStreamOperationCurrent(reconnectGeneration)) {
+          Log.logPrint(failure);
+          _scheduleStreamReconnect(reconnectGeneration);
+        }
+      } finally {
+        if (_mediaRecoveryGeneration == reconnectGeneration) {
+          _mediaRecoveryGeneration = null;
+        }
+        _checkPendingPlaybackFailure(reconnectGeneration);
+      }
+    });
+  }
+
   void _checkPendingPlaybackFailure(int generation) {
     if (_pendingPlaybackFailureGeneration != generation ||
         !_isStreamOperationCurrent(generation) ||
@@ -693,10 +853,14 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     final error = _pendingPlaybackError;
     _pendingPlaybackFailureGeneration = null;
     _pendingPlaybackError = null;
-    // 重开期间的旧连接事件可忽略，但新连接立即失败时仍需继续恢复。
-    if (errorMsg.value.isEmpty &&
-        (player.state.completed || !player.state.playing)) {
+    if (errorMsg.value.isNotEmpty) {
+      return;
+    }
+    // 重开期间的错误也先检查进度，避免 START_FILE 的 playing 提前置真。
+    if (player.state.completed) {
       unawaited(_recoverPlayback(error: error));
+    } else if (error != null) {
+      unawaited(mediaError(error));
     }
   }
 
@@ -708,9 +872,14 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     }
     // 持续播放后才恢复重试预算，避免连接刚打开就失败时无限重试。
     final generation = _streamOperationGeneration;
+    final position = player.state.position;
     _playbackStableTimer = Timer(const Duration(seconds: 10), () {
-      if (_isStreamOperationCurrent(generation) && player.state.playing) {
+      if (_isStreamOperationCurrent(generation) &&
+          player.state.playing &&
+          !player.state.buffering &&
+          player.state.position > position) {
         mediaErrorRetryCount = 0;
+        _streamReconnectAttempt = 0;
       }
     });
   }
@@ -1201,6 +1370,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       return;
     }
 
+    _cancelPlaybackRecovery();
     final generation = ++_streamOperationGeneration;
     _streamLoadGeneration = generation;
     _playbackStableTimer?.cancel();
@@ -1245,7 +1415,11 @@ $_loadErrorStackTrace''');
       Log.d("进入后台");
       //进入后台，关闭弹幕
       danmakuController?.clear();
-      _resumeStreamPending = _resumeStreamPending || _isChangingStream;
+      _resumeStreamPending = _resumeStreamPending ||
+          _isChangingStream ||
+          _streamReconnectTimer != null ||
+          _playbackErrorTimer != null;
+      _cancelPlaybackRecovery(resetBackoff: false);
       isBackground = true;
       _streamOperationGeneration += 1;
       _playbackStableTimer?.cancel();
@@ -1333,40 +1507,13 @@ $_loadErrorStackTrace''');
 
     _backgroundReloadGeneration = operationGeneration;
     try {
-      final refreshedDetail = await site.liveSite.getRoomDetail(roomId: roomId);
-      if (!_isStreamOperationCurrent(operationGeneration)) {
-        return;
-      }
-
-      detail.value = refreshedDetail;
-      online.value = refreshedDetail.online;
-      liveStatus.value = refreshedDetail.status || refreshedDetail.isRecord;
-      startLiveDurationTimer();
-
-      if (!liveStatus.value) {
-        await player.stop();
-        if (!_isStreamOperationCurrent(operationGeneration)) {
-          return;
-        }
-        await WakelockPlus.disable();
-        if (!_isStreamOperationCurrent(operationGeneration)) {
-          return;
-        }
-        qualites.clear();
-        playUrls.clear();
-        currentQuality = -1;
-        currentLineIndex = -1;
-        return;
-      }
-
       mediaErrorRetryCount = 0;
-      await getPlayQualites(operationGeneration: operationGeneration);
+      await _refreshPlaybackData(operationGeneration, preserveLine: true);
     } catch (error) {
       if (_isStreamOperationCurrent(operationGeneration)) {
         Log.logPrint(error);
-        errorMsg.value = "恢复直播失败，请刷新重试";
         addSysMsg("恢复直播失败：$error");
-        SmartDialog.showToast("恢复直播失败，请手动刷新");
+        _scheduleStreamReconnect(operationGeneration);
       }
     } finally {
       if (_backgroundReloadGeneration == operationGeneration) {
@@ -1416,6 +1563,7 @@ $_loadErrorStackTrace''');
     scrollController.removeListener(scrollListener);
     autoExitTimer?.cancel();
 
+    _cancelPlaybackRecovery();
     _streamOperationGeneration += 1;
     _backgroundReloadGeneration = null;
     _playbackStableTimer?.cancel();
