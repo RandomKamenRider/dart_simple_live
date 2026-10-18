@@ -49,7 +49,7 @@ mixin PlayerMixin {
       }
     }
     // media_kit 仓库更新导致的问题，临时解决办法
-    if(Platform.isAndroid){
+    if (Platform.isAndroid) {
       await pp.setProperty('force-seekable', 'yes');
     }
   }
@@ -674,6 +674,7 @@ class PlayerController extends BaseController
   StreamSubscription? _heightSubscription;
   StreamSubscription? _logSubscription;
   StreamSubscription? _playingSubscription;
+  StreamSubscription? _bufferingSubscription;
 
   void initStream() {
     _errorSubscription = player.stream.error.listen((event) {
@@ -688,11 +689,13 @@ class PlayerController extends BaseController
     });
 
     _playingSubscription = player.stream.playing.listen((event) {
+      onPlayingChanged(event);
       if (event) {
         WakelockPlus.enable();
         Log.d("Playing");
       }
     });
+    _bufferingSubscription = player.stream.buffering.listen(onBufferingChanged);
 
     _completedSubscription = player.stream.completed.listen((event) {
       if (event) {
@@ -724,11 +727,16 @@ class PlayerController extends BaseController
     _logSubscription?.cancel();
     _pipSubscription?.cancel();
     _playingSubscription?.cancel();
+    _bufferingSubscription?.cancel();
   }
 
   void mediaEnd() {
     WakelockPlus.disable();
   }
+
+  void onPlayingChanged(bool playing) {}
+
+  void onBufferingChanged(bool buffering) {}
 
   void mediaError(String error) {
     WakelockPlus.disable();

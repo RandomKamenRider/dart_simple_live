@@ -109,9 +109,31 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   /// 返回前台后延迟重连弹幕，等待 Android 网络与 DNS 恢复
   Timer? _danmakuResumeTimer;
 
+  /// 当前后台恢复操作代次；存在时忽略旧播放连接产生的结束和错误事件。
+  int? _backgroundReloadGeneration;
+
+  bool get _isReloadingAfterBackground =>
+      _backgroundReloadGeneration == _streamOperationGeneration;
+
+  /// 播放数据加载代次，用于丢弃旧异步请求的结果。
+  int _streamOperationGeneration = 0;
+
+  int? _streamLoadGeneration;
+  int? _mediaRecoveryGeneration;
+  Timer? _playbackStableTimer;
+  bool _resumeStreamPending = false;
+  int? _pendingPlaybackFailureGeneration;
+  String? _pendingPlaybackError;
+
+  bool get _isChangingStream =>
+      _streamLoadGeneration == _streamOperationGeneration ||
+      _mediaRecoveryGeneration == _streamOperationGeneration ||
+      _isReloadingAfterBackground;
+
   /// 直播间加载失败
   var loadError = false.obs;
-  Error? error;
+  Object? error;
+  StackTrace? _loadErrorStackTrace;
 
   // 开播时长状态变量
   var liveDuration = "00:00:00".obs;
@@ -288,14 +310,22 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   }
 
   /// 加载直播间信息
-  void loadData() async {
+  Future<void> loadData() async {
+    final generation = ++_streamOperationGeneration;
+    _streamLoadGeneration = generation;
+    _playbackStableTimer?.cancel();
     try {
       SmartDialog.showLoading(msg: "");
       loadError.value = false;
       error = null;
+      _loadErrorStackTrace = null;
       update();
       addSysMsg("正在读取直播间信息");
-      detail.value = await site.liveSite.getRoomDetail(roomId: roomId);
+      final roomDetail = await site.liveSite.getRoomDetail(roomId: roomId);
+      if (!_isStreamOperationCurrent(generation)) {
+        return;
+      }
+      detail.value = roomDetail;
 
       if (site.id == Constant.kDouyin) {
         // 1.6.0之前收藏的WebRid
@@ -332,7 +362,15 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       online.value = detail.value!.online;
       liveStatus.value = detail.value!.status || detail.value!.isRecord;
       if (liveStatus.value) {
-        getPlayQualites();
+        await getPlayQualites(operationGeneration: generation);
+      } else {
+        await player.stop();
+        if (_isStreamOperationCurrent(generation)) {
+          await WakelockPlus.disable();
+        }
+      }
+      if (!_isStreamOperationCurrent(generation)) {
+        return;
       }
       if (detail.value!.isRecord) {
         addSysMsg("当前主播未开播，正在轮播录像");
@@ -341,31 +379,50 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       initDanmau();
       liveDanmaku.start(detail.value?.danmakuData);
       startLiveDurationTimer(); // 启动开播时长定时器
-    } catch (e) {
+    } catch (e, stackTrace) {
+      if (!_isStreamOperationCurrent(generation)) {
+        return;
+      }
       Log.logPrint(e);
       //SmartDialog.showToast(e.toString());
       loadError.value = true;
-      error = e as Error;
+      error = e;
+      _loadErrorStackTrace = stackTrace;
     } finally {
+      if (_streamLoadGeneration == generation) {
+        _streamLoadGeneration = null;
+      }
+      _checkPendingPlaybackFailure(generation);
       SmartDialog.dismiss(status: SmartStatus.loading);
     }
   }
 
   /// 初始化播放器
-  void getPlayQualites() async {
-    qualites.clear();
-    currentQuality = -1;
+  Future<void> getPlayQualites({int? operationGeneration}) async {
+    final generation = operationGeneration ?? ++_streamOperationGeneration;
+    if (!_isStreamOperationCurrent(generation)) {
+      return;
+    }
+    if (operationGeneration == null) {
+      _streamLoadGeneration = generation;
+    }
+    _playbackStableTimer?.cancel();
 
     try {
       var playQualites =
           await site.liveSite.getPlayQualites(detail: detail.value!);
+      if (!_isStreamOperationCurrent(generation)) {
+        return;
+      }
 
       if (playQualites.isEmpty) {
-        SmartDialog.showToast("无法读取播放清晰度");
+        throw StateError("无法读取播放清晰度");
+      }
+      var qualityLevel = await getQualityLevel();
+      if (!_isStreamOperationCurrent(generation)) {
         return;
       }
       qualites.value = playQualites;
-      var qualityLevel = await getQualityLevel();
       if (qualityLevel == 2) {
         //最高
         currentQuality = 0;
@@ -378,10 +435,22 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         currentQuality = middle;
       }
 
-      getPlayUrl();
+      await getPlayUrl(operationGeneration: generation);
     } catch (e) {
+      if (!_isStreamOperationCurrent(generation)) {
+        return;
+      }
       Log.logPrint(e);
+      errorMsg.value = "无法读取播放数据，请刷新重试";
+      if (operationGeneration != null) {
+        rethrow;
+      }
       SmartDialog.showToast("无法读取播放清晰度");
+    } finally {
+      if (operationGeneration == null && _streamLoadGeneration == generation) {
+        _streamLoadGeneration = null;
+        _checkPendingPlaybackFailure(generation);
+      }
     }
   }
 
@@ -403,122 +472,252 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   ///
   /// [resetRetryCount] 为 true 时重置错误重试计数（正常首播/切清晰度场景）；
   /// 由错误重试触发时应传 false，以保留计数，避免陷入无限重试而无法切换线路。
-  void getPlayUrl({bool resetRetryCount = true}) async {
-    playUrls.clear();
-    currentQualityInfo.value = qualites[currentQuality].quality;
-    currentLineInfo.value = "";
-    currentLineIndex = -1;
-    var playUrl = await site.liveSite
-        .getPlayUrls(detail: detail.value!, quality: qualites[currentQuality]);
-    if (playUrl.urls.isEmpty) {
-      SmartDialog.showToast("无法读取播放地址");
+  Future<void> getPlayUrl({
+    bool resetRetryCount = true,
+    int? operationGeneration,
+    bool preserveLine = false,
+  }) async {
+    final generation = operationGeneration ?? ++_streamOperationGeneration;
+    if (!_isStreamOperationCurrent(generation) ||
+        detail.value == null ||
+        currentQuality < 0 ||
+        currentQuality >= qualites.length) {
       return;
     }
-    playUrls.value = playUrl.urls;
-    playHeaders = playUrl.headers;
-    currentLineIndex = 0;
-    currentLineInfo.value = "线路${currentLineIndex + 1}";
-    if (resetRetryCount) {
-      //重置错误次数
-      mediaErrorRetryCount = 0;
+    if (operationGeneration == null) {
+      _streamLoadGeneration = generation;
     }
-    initPlaylist();
+    _playbackStableTimer?.cancel();
+    final quality = qualites[currentQuality];
+    final previousLineIndex = currentLineIndex;
+    try {
+      final playUrl = await site.liveSite
+          .getPlayUrls(detail: detail.value!, quality: quality);
+      if (!_isStreamOperationCurrent(generation)) {
+        return;
+      }
+      if (playUrl.urls.isEmpty) {
+        throw StateError("无法读取播放地址");
+      }
+
+      // 保留旧线路直到新地址就绪，避免结束事件把临时空列表误判为关播。
+      playUrls.value = playUrl.urls;
+      playHeaders = playUrl.headers;
+      currentQualityInfo.value = quality.quality;
+      currentLineIndex = preserveLine &&
+              previousLineIndex >= 0 &&
+              previousLineIndex < playUrl.urls.length
+          ? previousLineIndex
+          : 0;
+      if (resetRetryCount) {
+        mediaErrorRetryCount = 0;
+      }
+      await initPlaylist(operationGeneration: generation);
+    } catch (failure) {
+      if (operationGeneration != null) {
+        rethrow;
+      }
+      if (_isStreamOperationCurrent(generation)) {
+        Log.logPrint(failure);
+        errorMsg.value = "无法读取播放地址，请刷新重试";
+      }
+    } finally {
+      if (operationGeneration == null && _streamLoadGeneration == generation) {
+        _streamLoadGeneration = null;
+        _checkPendingPlaybackFailure(generation);
+      }
+    }
   }
 
-  void changePlayLine(int index) {
+  Future<void> changePlayLine(int index) async {
+    if (index < 0 || index >= playUrls.length) {
+      return;
+    }
+    final generation = ++_streamOperationGeneration;
+    _streamLoadGeneration = generation;
+    _playbackStableTimer?.cancel();
     currentLineIndex = index;
     //重置错误次数
     mediaErrorRetryCount = 0;
-    setPlayer();
+    try {
+      await initPlaylist(operationGeneration: generation);
+    } catch (failure) {
+      if (_isStreamOperationCurrent(generation)) {
+        Log.logPrint(failure);
+        errorMsg.value = "切换线路失败，请刷新重试";
+      }
+    } finally {
+      if (_streamLoadGeneration == generation) {
+        _streamLoadGeneration = null;
+      }
+      _checkPendingPlaybackFailure(generation);
+    }
   }
 
-  void initPlaylist() async {
+  Future<void> initPlaylist({required int operationGeneration}) async {
+    if (!_isStreamOperationCurrent(operationGeneration)) {
+      return;
+    }
     currentLineInfo.value = "线路${currentLineIndex + 1}";
     errorMsg.value = "";
 
-    final mediaList = playUrls.map((url) {
-      var finalUrl = url;
-      if (AppSettingsController.instance.playerForceHttps.value) {
-        finalUrl = finalUrl.replaceAll("http://", "https://");
-      }
-      return Media(finalUrl, httpHeaders: playHeaders);
-    }).toList();
+    if (currentLineIndex < 0 || currentLineIndex >= playUrls.length) {
+      return;
+    }
+    var url = playUrls[currentLineIndex];
+    if (AppSettingsController.instance.playerForceHttps.value) {
+      url = url.replaceAll("http://", "https://");
+    }
 
     // 初始化播放器并设置 ao 参数
     await initializePlayer();
-
-    await player.open(Playlist(mediaList));
-  }
-
-  void setPlayer() async {
-    currentLineInfo.value = "线路${currentLineIndex + 1}";
-    errorMsg.value = "";
-
-    await player.jump(currentLineIndex);
-  }
-
-  @override
-  void mediaEnd() async {
-    super.mediaEnd();
-    if (mediaErrorRetryCount < 2) {
-      Log.d("播放结束，尝试第${mediaErrorRetryCount + 1}次刷新");
-      if (mediaErrorRetryCount == 1) {
-        //延迟一秒再刷新
-        await Future.delayed(const Duration(seconds: 1));
-      }
-      mediaErrorRetryCount += 1;
-      //重新拉取播放地址后再刷新，避免复用已失效或过期的直播地址
-      retryPlay();
+    if (!_isStreamOperationCurrent(operationGeneration)) {
       return;
     }
 
-    Log.d("播放结束");
-    // 遍历线路，如果全部链接都断开就是直播结束了
-    if (playUrls.length - 1 == currentLineIndex) {
-      liveStatus.value = false;
-    } else {
-      changePlayLine(currentLineIndex + 1);
-
-      //setPlayer();
+    // 各线路是同一直播的备用地址，由控制器统一重试和切换。
+    await player.open(Media(url, httpHeaders: playHeaders));
+    if (_isStreamOperationCurrent(operationGeneration) &&
+        !player.state.playing) {
+      await player.play();
     }
   }
+
+  Future<void> setPlayer() async {
+    await changePlayLine(currentLineIndex);
+  }
+
+  bool _isStreamOperationCurrent(int generation) {
+    return generation == _streamOperationGeneration &&
+        !isBackground &&
+        !isClosed;
+  }
+
+  @override
+  Future<void> mediaEnd() => _recoverPlayback();
 
   int mediaErrorRetryCount = 0;
   @override
-  void mediaError(String error) async {
-    super.mediaError(error);
-    if (mediaErrorRetryCount < 2) {
-      Log.d("播放失败，尝试第${mediaErrorRetryCount + 1}次刷新");
-      if (mediaErrorRetryCount == 1) {
-        //延迟一秒再刷新
-        await Future.delayed(const Duration(seconds: 1));
-      }
-      mediaErrorRetryCount += 1;
-      //重新拉取播放地址后再刷新，避免复用已失效或过期的直播地址
-      retryPlay();
+  Future<void> mediaError(String error) => _recoverPlayback(error: error);
+
+  Future<void> _recoverPlayback({String? error}) async {
+    if (isClosed || !liveStatus.value) {
       return;
     }
-
-    if (playUrls.length - 1 == currentLineIndex) {
-      errorMsg.value = "播放失败";
-      SmartDialog.showToast("播放失败:$error");
-    } else {
-      //currentLineIndex += 1;
-      //setPlayer();
-      changePlayLine(currentLineIndex + 1);
+    if (_isChangingStream) {
+      _pendingPlaybackFailureGeneration = _streamOperationGeneration;
+      _pendingPlaybackError = error;
+      return;
+    }
+    _playbackStableTimer?.cancel();
+    if (isBackground) {
+      _resumeStreamPending = true;
+      return;
+    }
+    final generation = ++_streamOperationGeneration;
+    _mediaRecoveryGeneration = generation;
+    try {
+      if (mediaErrorRetryCount < 2) {
+        mediaErrorRetryCount += 1;
+        Log.d("直播流断开，重试次数：$mediaErrorRetryCount，原因：${error ?? '播放结束'}");
+        if (mediaErrorRetryCount == 2) {
+          await Future<void>.delayed(const Duration(seconds: 1));
+        }
+        if (!_isStreamOperationCurrent(generation)) {
+          return;
+        }
+        try {
+          await getPlayUrl(
+            resetRetryCount: false,
+            operationGeneration: generation,
+            preserveLine: true,
+          );
+        } catch (failure) {
+          if (!_isStreamOperationCurrent(generation)) {
+            return;
+          }
+          if (currentLineIndex < 0 || currentLineIndex >= playUrls.length) {
+            rethrow;
+          }
+          Log.d("刷新地址失败，尝试重连现有线路：$failure");
+          await initPlaylist(operationGeneration: generation);
+        }
+      } else if (currentLineIndex >= 0 &&
+          currentLineIndex + 1 < playUrls.length) {
+        await changePlayLine(currentLineIndex + 1);
+      } else {
+        // 播放连接结束并不能证明主播下播，必须向平台确认状态。
+        final refreshedDetail =
+            await site.liveSite.getRoomDetail(roomId: roomId);
+        if (!_isStreamOperationCurrent(generation)) {
+          return;
+        }
+        detail.value = refreshedDetail;
+        online.value = refreshedDetail.online;
+        if (!refreshedDetail.status && !refreshedDetail.isRecord) {
+          liveStatus.value = false;
+          startLiveDurationTimer();
+          await player.stop();
+          if (_isStreamOperationCurrent(generation)) {
+            await WakelockPlus.disable();
+          }
+        } else {
+          errorMsg.value = "直播流已断开，请刷新重试";
+        }
+      }
+    } catch (failure) {
+      if (_isStreamOperationCurrent(generation)) {
+        Log.logPrint(failure);
+        errorMsg.value = "恢复播放失败，请刷新重试";
+        addSysMsg("恢复播放失败：$failure");
+      }
+    } finally {
+      if (_mediaRecoveryGeneration == generation) {
+        _mediaRecoveryGeneration = null;
+      }
+      if (_isStreamOperationCurrent(generation) &&
+          errorMsg.value.isNotEmpty &&
+          (player.state.completed || !player.state.playing)) {
+        await WakelockPlus.disable();
+      }
+      _checkPendingPlaybackFailure(_streamOperationGeneration);
     }
   }
 
-  /// 播放结束/失败时的重试。
-  ///
-  /// 优先重新向站点请求当前清晰度的播放地址，用新地址重开播放器；
-  /// 若房间信息缺失则退化为在现有地址上重连，保证兜底能力。
-  void retryPlay() {
-    if (detail.value != null && liveStatus.value) {
-      getPlayUrl(resetRetryCount: false);
-    } else {
-      setPlayer();
+  void _checkPendingPlaybackFailure(int generation) {
+    if (_pendingPlaybackFailureGeneration != generation ||
+        !_isStreamOperationCurrent(generation) ||
+        _isChangingStream) {
+      return;
     }
+    final error = _pendingPlaybackError;
+    _pendingPlaybackFailureGeneration = null;
+    _pendingPlaybackError = null;
+    // 重开期间的旧连接事件可忽略，但新连接立即失败时仍需继续恢复。
+    if (errorMsg.value.isEmpty &&
+        (player.state.completed || !player.state.playing)) {
+      unawaited(_recoverPlayback(error: error));
+    }
+  }
+
+  @override
+  void onPlayingChanged(bool playing) {
+    _playbackStableTimer?.cancel();
+    if (!playing || isClosed || player.state.buffering) {
+      return;
+    }
+    // 持续播放后才恢复重试预算，避免连接刚打开就失败时无限重试。
+    final generation = _streamOperationGeneration;
+    _playbackStableTimer = Timer(const Duration(seconds: 10), () {
+      if (_isStreamOperationCurrent(generation) && player.state.playing) {
+        mediaErrorRetryCount = 0;
+      }
+    });
+  }
+
+  @override
+  void onBufferingChanged(bool buffering) {
+    onPlayingChanged(player.state.playing && !buffering);
   }
 
   /// 读取SC
@@ -997,11 +1196,16 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     }
   }
 
-  void resetRoom(Site site, String roomId) async {
+  Future<void> resetRoom(Site site, String roomId) async {
     if (this.site == site && this.roomId == roomId) {
       return;
     }
 
+    final generation = ++_streamOperationGeneration;
+    _streamLoadGeneration = generation;
+    _playbackStableTimer?.cancel();
+    _danmakuResumeTimer?.cancel();
+    _danmakuResumeTimer = null;
     rxSite.value = site;
     rxRoomId.value = roomId;
 
@@ -1018,7 +1222,9 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     await player.stop();
 
     // 刷新信息
-    loadData();
+    if (_isStreamOperationCurrent(generation)) {
+      await loadData();
+    }
   }
 
   void copyErrorDetail() {
@@ -1027,7 +1233,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 错误信息：
 ${error?.toString()}
 ----------------
-${error?.stackTrace}''');
+$_loadErrorStackTrace''');
     SmartDialog.showToast("已复制错误信息");
   }
 
@@ -1039,7 +1245,10 @@ ${error?.stackTrace}''');
       Log.d("进入后台");
       //进入后台，关闭弹幕
       danmakuController?.clear();
+      _resumeStreamPending = _resumeStreamPending || _isChangingStream;
       isBackground = true;
+      _streamOperationGeneration += 1;
+      _playbackStableTimer?.cancel();
       _enterBackgroundTime = DateTime.now();
       _danmakuResumeTimer?.cancel();
       _danmakuResumeTimer = null;
@@ -1051,8 +1260,8 @@ ${error?.stackTrace}''');
       isBackground = false;
       // canvas_danmaku 进入后台时会暂停内部渲染，返回前台后不会自动恢复。
       danmakuController?.resume();
-      _restartDanmakuAfterResume();
-      _handleResumeFromBackground();
+      onPlayingChanged(player.state.playing);
+      unawaited(_handleResumeFromBackground());
     }
   }
 
@@ -1091,42 +1300,82 @@ ${error?.stackTrace}''');
   ///
   /// 直播地址带有时效签名，App 挂后台期间连接可能被系统挂起或地址失效，
   /// 播放器若继续使用旧连接会停留在过期缓冲、落后于真实直播进度，
-  /// 表现为画面卡住或视频流被截断。因此后台停留超过阈值时重新拉取播放地址并重开播放器。
-  void _handleResumeFromBackground() {
+  /// 表现为画面卡住或视频流被截断。因此后台停留超过阈值时重新读取直播间详情，
+  /// 生成新的签名、清晰度数据和播放地址后重开播放器。
+  Future<void> _handleResumeFromBackground() async {
     final enterTime = _enterBackgroundTime;
     _enterBackgroundTime = null;
 
-    // 仅在直播中才需要重新拉流；录像/未开播无需处理
-    if (!liveStatus.value) {
-      return;
-    }
     if (enterTime == null) {
+      _restartDanmakuAfterResume();
       return;
     }
 
     final backgroundDuration = DateTime.now().difference(enterTime);
-    if (backgroundDuration < _backgroundReloadThreshold) {
+    if (!_resumeStreamPending &&
+        (!liveStatus.value ||
+            backgroundDuration < _backgroundReloadThreshold)) {
+      _restartDanmakuAfterResume();
       return;
     }
 
-    Log.d("后台停留${backgroundDuration.inSeconds}秒，重新拉取直播流");
-    reloadStream();
+    final operationGeneration = ++_streamOperationGeneration;
+    _resumeStreamPending = false;
+    Log.d("后台停留${backgroundDuration.inSeconds}秒，重新读取直播间和播放数据");
+    await _reloadRoomAfterBackground(operationGeneration);
   }
 
-  /// 重新拉取直播地址并重开播放器，用于追赶直播真实进度。
-  ///
-  /// 与 [refreshRoom] 不同，此方法不重连弹幕、不重新拉取房间详情，
-  /// 仅在已有房间信息的基础上重新获取播放地址，尽量减少对已有连接的干扰。
-  void reloadStream() {
-    if (detail.value == null || !liveStatus.value) {
+  /// 重新读取直播间详情并重开播放器，用于刷新平台签名和追赶直播进度。
+  Future<void> _reloadRoomAfterBackground(int operationGeneration) async {
+    if (!_isStreamOperationCurrent(operationGeneration)) {
       return;
     }
-    mediaErrorRetryCount = 0;
-    if (qualites.isEmpty || currentQuality < 0) {
-      // 尚未成功获取过清晰度时，走完整的清晰度+地址获取流程
-      getPlayQualites();
-    } else {
-      getPlayUrl();
+
+    _backgroundReloadGeneration = operationGeneration;
+    try {
+      final refreshedDetail = await site.liveSite.getRoomDetail(roomId: roomId);
+      if (!_isStreamOperationCurrent(operationGeneration)) {
+        return;
+      }
+
+      detail.value = refreshedDetail;
+      online.value = refreshedDetail.online;
+      liveStatus.value = refreshedDetail.status || refreshedDetail.isRecord;
+      startLiveDurationTimer();
+
+      if (!liveStatus.value) {
+        await player.stop();
+        if (!_isStreamOperationCurrent(operationGeneration)) {
+          return;
+        }
+        await WakelockPlus.disable();
+        if (!_isStreamOperationCurrent(operationGeneration)) {
+          return;
+        }
+        qualites.clear();
+        playUrls.clear();
+        currentQuality = -1;
+        currentLineIndex = -1;
+        return;
+      }
+
+      mediaErrorRetryCount = 0;
+      await getPlayQualites(operationGeneration: operationGeneration);
+    } catch (error) {
+      if (_isStreamOperationCurrent(operationGeneration)) {
+        Log.logPrint(error);
+        errorMsg.value = "恢复直播失败，请刷新重试";
+        addSysMsg("恢复直播失败：$error");
+        SmartDialog.showToast("恢复直播失败，请手动刷新");
+      }
+    } finally {
+      if (_backgroundReloadGeneration == operationGeneration) {
+        _backgroundReloadGeneration = null;
+        if (_isStreamOperationCurrent(operationGeneration)) {
+          _restartDanmakuAfterResume();
+          _checkPendingPlaybackFailure(operationGeneration);
+        }
+      }
     }
   }
 
@@ -1167,6 +1416,9 @@ ${error?.stackTrace}''');
     scrollController.removeListener(scrollListener);
     autoExitTimer?.cancel();
 
+    _streamOperationGeneration += 1;
+    _backgroundReloadGeneration = null;
+    _playbackStableTimer?.cancel();
     _danmakuResumeTimer?.cancel();
     _danmakuResumeTimer = null;
     liveDanmaku.stop();

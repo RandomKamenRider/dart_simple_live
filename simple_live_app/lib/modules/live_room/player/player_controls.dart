@@ -69,10 +69,14 @@ Widget buildFullControls(
               StreamBuilder(
             stream: videoState.widget.controller.player.stream.buffering,
             initialData: videoState.widget.controller.player.state.buffering,
-            builder: (_, s) => Visibility(
-              visible: s.data ?? false,
-              child: const Center(
-                child: CircularProgressIndicator(),
+            builder: (_, s) => Obx(
+              () => Visibility(
+                visible: controller.liveStatus.value &&
+                    controller.errorMsg.value.isEmpty &&
+                    (s.data ?? false),
+                child: const Center(
+                  child: CircularProgressIndicator(),
+                ),
               ),
             ),
           ),
@@ -455,10 +459,14 @@ Widget buildControls(
         child: StreamBuilder(
           stream: videoState.widget.controller.player.stream.buffering,
           initialData: videoState.widget.controller.player.state.buffering,
-          builder: (_, s) => Visibility(
-            visible: s.data ?? false,
-            child: const Center(
-              child: CircularProgressIndicator(),
+          builder: (_, s) => Obx(
+            () => Visibility(
+              visible: controller.liveStatus.value &&
+                  controller.errorMsg.value.isEmpty &&
+                  (s.data ?? false),
+              child: const Center(
+                child: CircularProgressIndicator(),
+              ),
             ),
           ),
         ),

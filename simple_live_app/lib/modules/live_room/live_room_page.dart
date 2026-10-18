@@ -273,11 +273,18 @@ class LiveRoomPage extends GetView<LiveRoomController> {
         ),
         Obx(
           () => Visibility(
-            visible: !controller.liveStatus.value,
-            child: const Center(
-              child: Text(
-                "未开播",
-                style: TextStyle(fontSize: 16, color: Colors.white),
+            visible: !controller.liveStatus.value ||
+                controller.errorMsg.value.isNotEmpty,
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Text(
+                  controller.liveStatus.value
+                      ? controller.errorMsg.value
+                      : "未开播",
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 16, color: Colors.white),
+                ),
               ),
             ),
           ),
