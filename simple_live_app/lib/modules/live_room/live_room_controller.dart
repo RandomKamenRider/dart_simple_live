@@ -128,6 +128,51 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   Completer<void>? _playbackErrorCheck;
   Timer? _streamReconnectTimer;
   int _streamReconnectAttempt = 0;
+  StreamSubscription<Playlist>? _playlistSubscription;
+
+  @override
+  void initStream() {
+    super.initStream();
+    _playlistSubscription = player.stream.playlist.listen((_) {
+      syncPlayLine();
+    });
+  }
+
+  void syncPlayLine() {
+    if (isClosed || isBackground || _isChangingStream) {
+      return;
+    }
+    final playlist = player.state.playlist;
+    if (playlist.index < 0 ||
+        playlist.index >= playUrls.length ||
+        !_matchesPlayUrls(playlist)) {
+      return;
+    }
+    if (currentLineIndex != playlist.index) {
+      currentLineIndex = playlist.index;
+      currentLineInfo.value = "线路${currentLineIndex + 1}";
+      mediaErrorRetryCount = 0;
+    }
+  }
+
+  bool _matchesPlayUrls(Playlist playlist) {
+    if (playlist.medias.length != playUrls.length) {
+      return false;
+    }
+    for (var index = 0; index < playUrls.length; index += 1) {
+      if (playlist.medias[index].uri != _playMedia(playUrls[index]).uri) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Media _playMedia(String url) {
+    if (AppSettingsController.instance.playerForceHttps.value) {
+      url = url.replaceAll("http://", "https://");
+    }
+    return Media(url, httpHeaders: playHeaders);
+  }
 
   void _cancelPlaybackErrorCheck() {
     _playbackErrorTimer?.cancel();
@@ -591,7 +636,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     //重置错误次数
     mediaErrorRetryCount = 0;
     try {
-      await initPlaylist(operationGeneration: generation);
+      await _jumpToPlayLine(generation);
     } catch (failure) {
       if (operationGeneration != null) {
         rethrow;
@@ -618,10 +663,10 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     if (currentLineIndex < 0 || currentLineIndex >= playUrls.length) {
       return;
     }
-    var url = playUrls[currentLineIndex];
-    if (AppSettingsController.instance.playerForceHttps.value) {
-      url = url.replaceAll("http://", "https://");
-    }
+    final playlist = Playlist(
+      playUrls.map(_playMedia).toList(),
+      index: currentLineIndex,
+    );
 
     // 初始化播放器并设置 ao 参数
     await initializePlayer();
@@ -629,8 +674,24 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       return;
     }
 
-    // 各线路是同一直播的备用地址，由控制器统一重试和切换。
-    await player.open(Media(url, httpHeaders: playHeaders));
+    await player.open(playlist);
+  }
+
+  Future<void> _jumpToPlayLine(int generation) async {
+    if (!_isStreamOperationCurrent(generation) ||
+        currentLineIndex < 0 ||
+        currentLineIndex >= playUrls.length) {
+      return;
+    }
+    currentLineInfo.value = "线路${currentLineIndex + 1}";
+    errorMsg.value = "";
+    if (!_matchesPlayUrls(player.state.playlist)) {
+      // 新地址已就绪但列表尚未加载时，选线需要先安装这份新列表。
+      await initPlaylist(operationGeneration: generation);
+      return;
+    }
+    // 沿用原版在现有播放列表中重试，不重新请求地址或卸载整个列表。
+    await player.jump(currentLineIndex);
   }
 
   Future<void> setPlayer() async {
@@ -741,10 +802,11 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       return;
     }
     _cancelPlaybackErrorCheck();
+    syncPlayLine();
     final generation = ++_streamOperationGeneration;
     _mediaRecoveryGeneration = generation;
     try {
-      if (mediaErrorRetryCount < 2) {
+      if (mediaErrorRetryCount < 3) {
         mediaErrorRetryCount += 1;
         Log.d("直播流断开，重试次数：$mediaErrorRetryCount，原因：${error ?? '播放结束'}");
         if (mediaErrorRetryCount == 2) {
@@ -753,10 +815,10 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         if (!_isStreamOperationCurrent(generation)) {
           return;
         }
-        if (mediaErrorRetryCount == 1 &&
+        if (mediaErrorRetryCount <= 2 &&
             currentLineIndex >= 0 &&
             currentLineIndex < playUrls.length) {
-          await initPlaylist(operationGeneration: generation);
+          await _jumpToPlayLine(generation);
         } else {
           await _refreshPlaybackData(generation, preserveLine: true);
         }
@@ -845,6 +907,10 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   }
 
   void _checkPendingPlaybackFailure(int generation) {
+    if (_isStreamOperationCurrent(generation)) {
+      // 切流期间忽略的播放列表事件，在操作完成后按当前状态补同步。
+      syncPlayLine();
+    }
     if (_pendingPlaybackFailureGeneration != generation ||
         !_isStreamOperationCurrent(generation) ||
         _isChangingStream) {
@@ -1564,6 +1630,8 @@ $_loadErrorStackTrace''');
     autoExitTimer?.cancel();
 
     _cancelPlaybackRecovery();
+    _playlistSubscription?.cancel();
+    _playlistSubscription = null;
     _streamOperationGeneration += 1;
     _backgroundReloadGeneration = null;
     _playbackStableTimer?.cancel();
