@@ -76,6 +76,17 @@ void main() {
     return controller.mediaEnd();
   }
 
+  Future<void> advancePlayback(
+    WidgetTester tester,
+    _TestRoomController controller,
+    int seconds,
+  ) async {
+    for (var second = 0; second < seconds; second += 1) {
+      controller.fakePlayer.position += const Duration(seconds: 1);
+      await tester.pump(const Duration(seconds: 1));
+    }
+  }
+
   testWidgets('refresh keeps current lines and ignores old media events',
       (tester) async {
     final pendingUrls = Completer<LivePlayUrl>();
@@ -136,7 +147,7 @@ void main() {
     expect(site.urlRequests, 1);
   });
 
-  testWidgets('native playlist advancement synchronizes selected backup line',
+  testWidgets('native playlist advancement preserves the pending retry budget',
       (tester) async {
     final site = _TestLiveSite();
     final controller = createController(site)..mediaErrorRetryCount = 2;
@@ -148,13 +159,57 @@ void main() {
     controller.syncPlayLine();
 
     expect(controller.currentLineIndex, 1);
-    expect(controller.mediaErrorRetryCount, 0);
+    expect(controller.mediaErrorRetryCount, 2);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.fakePlayer.jumpedIndexes, isEmpty);
     await completePlayback(controller);
-    expect(controller.fakePlayer.jumpedIndexes, [1]);
-    expect(site.urlRequests, 0);
-    expect(site.detailRequests, 0);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.openedUris, [_refreshedUrls.last]);
+    expect(controller.mediaErrorRetryCount, 3);
+    expect(site.urlRequests, 1);
+    expect(site.detailRequests, 1);
+  });
+
+  testWidgets('a native backup restores retries only after stable playback',
+      (tester) async {
+    final controller = createController(_TestLiveSite())
+      ..mediaErrorRetryCount = 2;
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _originalUrls.map(Media.new).toList(),
+      index: 1,
+    );
+    await Future<void>.microtask(controller.syncPlayLine);
+
+    expect(controller.currentLineIndex, 1);
+    expect(controller.mediaErrorRetryCount, 2);
+    controller.onPlayingChanged(true);
+    await advancePlayback(tester, controller, 9);
+    expect(controller.mediaErrorRetryCount, 2);
+    await advancePlayback(tester, controller, 1);
+    expect(controller.mediaErrorRetryCount, 0);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+  });
+
+  testWidgets('native line changes interrupt consecutive healthy samples',
+      (tester) async {
+    final controller = createController(_TestLiveSite())
+      ..mediaErrorRetryCount = 2;
+    controller.onPlayingChanged(true);
+    await advancePlayback(tester, controller, 5);
+
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _originalUrls.map(Media.new).toList(),
+      index: 1,
+    );
+    controller.fakePlayer.position = Duration.zero;
+    await Future<void>.microtask(controller.syncPlayLine);
+    await tester.pump(const Duration(seconds: 1));
+    await advancePlayback(tester, controller, 9);
+    expect(controller.mediaErrorRetryCount, 2);
+    await advancePlayback(tester, controller, 1);
+
+    expect(controller.mediaErrorRetryCount, 0);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
   });
 
   testWidgets(
@@ -339,6 +394,63 @@ void main() {
     expect(controller.mediaErrorRetryCount, 1);
   });
 
+  testWidgets('backward timestamps do not dismiss an error observation',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.fakePlayer.position = const Duration(seconds: 10);
+    final error = controller.mediaError('timestamp discontinuity');
+
+    for (var second = 1; second <= 5; second += 1) {
+      controller.fakePlayer.position = Duration(seconds: 10 - second);
+      await tester.pump(const Duration(seconds: 1));
+    }
+    await error;
+
+    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.mediaErrorRetryCount, 1);
+  });
+
+  testWidgets('advancing timestamps dismiss errors even while buffering',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site)..mediaErrorRetryCount = 2;
+    controller.fakePlayer.buffering = true;
+    final error = controller.mediaError('buffered transport warning');
+
+    await advancePlayback(tester, controller, 5);
+    await error;
+
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.openedUris, isEmpty);
+    expect(controller.mediaErrorRetryCount, 2);
+    expect(site.detailRequests, 0);
+    expect(site.urlRequests, 0);
+  });
+
+  testWidgets('native next rebases an outstanding error observation',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.fakePlayer.position = const Duration(seconds: 100);
+    final warning = controller.mediaError('old primary warning');
+    await tester.pump(const Duration(seconds: 4));
+
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _originalUrls.map(Media.new).toList(),
+      index: 1,
+    );
+    controller.fakePlayer.position = Duration.zero;
+    controller.syncPlayLine();
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump(const Duration(seconds: 4));
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    await tester.pump(const Duration(seconds: 1));
+    await warning;
+
+    expect(controller.currentLineIndex, 1);
+    expect(controller.fakePlayer.jumpedIndexes, [1]);
+    expect(controller.mediaErrorRetryCount, 1);
+  });
+
   testWidgets('an error while deliberately paused does not resume playback',
       (tester) async {
     final controller = createController(_TestLiveSite());
@@ -384,6 +496,52 @@ void main() {
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.fakePlayer.jumpedIndexes, [1]);
     expect(controller.mediaErrorRetryCount, 2);
+    expect(site.detailRequests, 0);
+    expect(site.urlRequests, 0);
+  });
+
+  testWidgets(
+      'progress during a delayed retry preserves the resumed connection',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site)..mediaErrorRetryCount = 1;
+    controller.fakePlayer.position = const Duration(seconds: 10);
+
+    final retry = completePlayback(controller);
+    controller.fakePlayer.completed = false;
+    controller.fakePlayer.buffering = true;
+    controller.fakePlayer.position = const Duration(seconds: 11);
+    await tester.pump(const Duration(seconds: 1));
+    await retry;
+
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.openedUris, isEmpty);
+    expect(controller.mediaErrorRetryCount, 2);
+    expect(controller.currentLineIndex, 0);
+    expect(site.detailRequests, 0);
+    expect(site.urlRequests, 0);
+  });
+
+  testWidgets('native next during a delayed retry preserves the new line',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site)..mediaErrorRetryCount = 1;
+    controller.fakePlayer.position = const Duration(seconds: 100);
+
+    final retry = completePlayback(controller);
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _originalUrls.map(Media.new).toList(),
+      index: 1,
+    );
+    controller.fakePlayer.completed = false;
+    controller.fakePlayer.position = Duration.zero;
+    await tester.pump(const Duration(seconds: 1));
+    await retry;
+
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.openedUris, isEmpty);
+    expect(controller.mediaErrorRetryCount, 2);
+    expect(controller.currentLineIndex, 1);
     expect(site.detailRequests, 0);
     expect(site.urlRequests, 0);
   });
@@ -550,6 +708,143 @@ void main() {
     expect(controller.liveStatus.value, isTrue);
     expect(controller.fakePlayer.openedUris, [_refreshedUrls.first]);
     expect(controller.fakePlayer.stopCalls, 0);
+  });
+
+  testWidgets(
+      'resumed progress cancels a queued room refresh before its deadline',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site, line: 1)
+      ..mediaErrorRetryCount = 3;
+    controller.fakePlayer.position = const Duration(seconds: 100);
+    await completePlayback(controller);
+    expect(controller.errorMsg.value, isNotEmpty);
+
+    controller.fakePlayer.completed = false;
+    controller.fakePlayer.buffering = true;
+    controller.fakePlayer.position = const Duration(seconds: 101);
+    await tester.pump(const Duration(seconds: 1));
+    expect(controller.errorMsg.value, isEmpty);
+    expect(site.detailRequests, 0);
+    await advancePlayback(tester, controller, 10);
+
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.openedUris, isEmpty);
+    expect(controller.mediaErrorRetryCount, 3);
+    expect(site.detailRequests, 0);
+    expect(site.urlRequests, 0);
+  });
+
+  testWidgets('native next rebases queued refresh timestamps before progress',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site, line: 1)
+      ..mediaErrorRetryCount = 3;
+    controller.fakePlayer.position = const Duration(seconds: 100);
+    await completePlayback(controller);
+
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _originalUrls.map(Media.new).toList(),
+    );
+    controller.fakePlayer.completed = false;
+    controller.fakePlayer.position = Duration.zero;
+    await tester.pump(const Duration(seconds: 1));
+    expect(controller.errorMsg.value, isNotEmpty);
+    expect(site.detailRequests, 0);
+    controller.fakePlayer.position = const Duration(seconds: 1);
+    await tester.pump(const Duration(seconds: 1));
+    expect(controller.errorMsg.value, isEmpty);
+    await advancePlayback(tester, controller, 5);
+
+    expect(controller.currentLineIndex, 0);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.openedUris, isEmpty);
+    expect(controller.mediaErrorRetryCount, 3);
+    expect(site.detailRequests, 0);
+    expect(site.urlRequests, 0);
+  });
+
+  testWidgets('native next at a queued refresh deadline gets a progress grace',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site, line: 1)
+      ..mediaErrorRetryCount = 3;
+    controller.fakePlayer.position = const Duration(seconds: 100);
+    await completePlayback(controller);
+    await tester.pump(const Duration(seconds: 1));
+
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _originalUrls.map(Media.new).toList(),
+    );
+    controller.fakePlayer.completed = false;
+    controller.fakePlayer.position = Duration.zero;
+    await tester.pump(const Duration(seconds: 1));
+    expect(controller.errorMsg.value, isNotEmpty);
+    expect(site.detailRequests, 0);
+    controller.fakePlayer.position = const Duration(seconds: 1);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(controller.errorMsg.value, isEmpty);
+    expect(controller.currentLineIndex, 0);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.openedUris, isEmpty);
+    expect(controller.mediaErrorRetryCount, 3);
+    expect(site.detailRequests, 0);
+    expect(site.urlRequests, 0);
+  });
+
+  testWidgets(
+      'a cancelled queued refresh still observes a later genuine freeze',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site, line: 1)
+      ..mediaErrorRetryCount = 3;
+    controller.fakePlayer.position = const Duration(seconds: 100);
+    await completePlayback(controller);
+
+    controller.fakePlayer.completed = false;
+    controller.fakePlayer.position = const Duration(seconds: 101);
+    await tester.pump(const Duration(seconds: 1));
+    expect(controller.errorMsg.value, isEmpty);
+    await tester.pump(const Duration(seconds: 14));
+    expect(controller.errorMsg.value, isEmpty);
+    expect(site.detailRequests, 0);
+    await tester.pump(const Duration(seconds: 1));
+    expect(controller.errorMsg.value, isNotEmpty);
+    expect(controller.mediaErrorRetryCount, 3);
+    await tester.pump(const Duration(seconds: 3));
+    expect(site.detailRequests, 0);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(site.detailRequests, 1);
+    expect(site.urlRequests, 1);
+    expect(controller.fakePlayer.openedUris, [_refreshedUrls.first]);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+  });
+
+  testWidgets(
+      'a queued refresh grace expires when the native line stays frozen',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site, line: 1)
+      ..mediaErrorRetryCount = 3;
+    controller.fakePlayer.position = const Duration(seconds: 100);
+    await completePlayback(controller);
+    await tester.pump(const Duration(seconds: 1));
+
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _originalUrls.map(Media.new).toList(),
+    );
+    controller.fakePlayer.completed = false;
+    controller.fakePlayer.position = Duration.zero;
+    await tester.pump(const Duration(seconds: 1));
+    expect(site.detailRequests, 0);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(site.detailRequests, 1);
+    expect(site.urlRequests, 1);
+    expect(controller.fakePlayer.openedUris, [_refreshedUrls.first]);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
   });
 
   testWidgets('offline platform confirmation stops playback after backoff',
@@ -744,11 +1039,37 @@ void main() {
       ..mediaErrorRetryCount = 2;
 
     controller.onPlayingChanged(true);
-    await tester.pump(const Duration(seconds: 9));
+    await advancePlayback(tester, controller, 9);
     expect(controller.mediaErrorRetryCount, 2);
-    controller.fakePlayer.position = const Duration(seconds: 10);
-    await tester.pump(const Duration(seconds: 1));
+    await advancePlayback(tester, controller, 1);
     expect(controller.mediaErrorRetryCount, 0);
+  });
+
+  testWidgets('one timestamp jump does not count as ten healthy samples',
+      (tester) async {
+    final controller = createController(_TestLiveSite())
+      ..mediaErrorRetryCount = 2;
+
+    controller.onPlayingChanged(true);
+    await tester.pump(const Duration(seconds: 9));
+    controller.fakePlayer.position = const Duration(seconds: 100);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(controller.mediaErrorRetryCount, 2);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+  });
+
+  testWidgets('brief progress followed by a freeze does not restore retries',
+      (tester) async {
+    final controller = createController(_TestLiveSite())
+      ..mediaErrorRetryCount = 2;
+
+    controller.onPlayingChanged(true);
+    await advancePlayback(tester, controller, 1);
+    await tester.pump(const Duration(seconds: 9));
+
+    expect(controller.mediaErrorRetryCount, 2);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
   });
 
   testWidgets('playing without progress does not restore the retry budget',
@@ -768,7 +1089,7 @@ void main() {
       ..mediaErrorRetryCount = 2;
 
     controller.onPlayingChanged(true);
-    await tester.pump(const Duration(seconds: 9));
+    await advancePlayback(tester, controller, 9);
     controller.fakePlayer.playing = false;
     controller.onPlayingChanged(false);
     await tester.pump(const Duration(seconds: 2));
@@ -782,7 +1103,7 @@ void main() {
       ..mediaErrorRetryCount = 2;
 
     controller.onPlayingChanged(true);
-    await tester.pump(const Duration(seconds: 9));
+    await advancePlayback(tester, controller, 9);
     controller.fakePlayer.buffering = true;
     controller.onBufferingChanged(true);
     await tester.pump(const Duration(seconds: 11));
@@ -790,11 +1111,303 @@ void main() {
 
     controller.fakePlayer.buffering = false;
     controller.onBufferingChanged(false);
-    await tester.pump(const Duration(seconds: 9));
+    await advancePlayback(tester, controller, 9);
     expect(controller.mediaErrorRetryCount, 2);
-    controller.fakePlayer.position = const Duration(seconds: 10);
-    await tester.pump(const Duration(seconds: 1));
+    await advancePlayback(tester, controller, 1);
     expect(controller.mediaErrorRetryCount, 0);
+  });
+
+  testWidgets('buffering between health samples still interrupts stability',
+      (tester) async {
+    final controller = createController(_TestLiveSite())
+      ..mediaErrorRetryCount = 2;
+    controller.onPlayingChanged(true);
+    await advancePlayback(tester, controller, 9);
+
+    controller.fakePlayer.buffering = true;
+    controller.onBufferingChanged(true);
+    await tester.pump(const Duration(milliseconds: 100));
+    controller.fakePlayer.buffering = false;
+    controller.onBufferingChanged(false);
+    controller.fakePlayer.position += const Duration(seconds: 1);
+    await tester.pump(const Duration(milliseconds: 900));
+    expect(controller.mediaErrorRetryCount, 2);
+    await advancePlayback(tester, controller, 9);
+    expect(controller.mediaErrorRetryCount, 2);
+    await advancePlayback(tester, controller, 1);
+
+    expect(controller.mediaErrorRetryCount, 0);
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+  });
+
+  testWidgets(
+      'silent buffering recovers after fifteen consecutive frozen seconds',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site);
+    controller.fakePlayer.buffering = true;
+    controller.onBufferingChanged(true);
+
+    await tester.pump(const Duration(seconds: 14));
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.mediaErrorRetryCount, 1);
+    expect(site.detailRequests, 0);
+    expect(site.urlRequests, 0);
+    expect(controller.liveStatus.value, isTrue);
+  });
+
+  testWidgets('silent stalled playback recovers even without buffering events',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.onPlayingChanged(true);
+
+    await tester.pump(const Duration(seconds: 15));
+
+    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.mediaErrorRetryCount, 1);
+  });
+
+  testWidgets('a later silent freeze recovers after an advancing error clears',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.onPlayingChanged(true);
+    final warning = controller.mediaError('old harmless warning');
+    await advancePlayback(tester, controller, 5);
+    await warning;
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+
+    await tester.pump(const Duration(seconds: 14));
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(controller.fakePlayer.jumpedIndexes, [0]);
+  });
+
+  for (final freezeSample in [false, true]) {
+    testWidgets(
+        'four minutes of ${freezeSample ? 'one-second stalls' : 'brief buffering'} every eight seconds preserve playback',
+        (tester) async {
+      final site = _TestLiveSite();
+      final controller = createController(site)..mediaErrorRetryCount = 2;
+      controller.onPlayingChanged(true);
+
+      for (var cycle = 0; cycle < 30; cycle += 1) {
+        controller.fakePlayer.buffering = true;
+        controller.onBufferingChanged(true);
+        if (freezeSample) {
+          await tester.pump(const Duration(seconds: 1));
+        } else {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        controller.fakePlayer.buffering = false;
+        controller.onBufferingChanged(false);
+        if (!freezeSample) {
+          controller.fakePlayer.position += const Duration(seconds: 1);
+          await tester.pump(const Duration(milliseconds: 900));
+        }
+        await advancePlayback(tester, controller, 7);
+
+        expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+        expect(controller.fakePlayer.openedUris, isEmpty);
+        expect(site.detailRequests, 0);
+        expect(site.urlRequests, 0);
+      }
+
+      expect(controller.liveStatus.value, isTrue);
+      expect(controller.mediaErrorRetryCount, 2);
+    });
+  }
+
+  testWidgets('advancing playback ignores a persistent buffering flag',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site)..mediaErrorRetryCount = 2;
+    controller.fakePlayer.buffering = true;
+    controller.onBufferingChanged(true);
+
+    await advancePlayback(tester, controller, 120);
+
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.openedUris, isEmpty);
+    expect(controller.mediaErrorRetryCount, 2);
+    expect(site.detailRequests, 0);
+    expect(site.urlRequests, 0);
+  });
+
+  testWidgets('forward timestamps clear the consecutive freeze timeout',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.fakePlayer.buffering = true;
+    controller.onBufferingChanged(true);
+    await tester.pump(const Duration(seconds: 14));
+
+    await advancePlayback(tester, controller, 1);
+    await tester.pump(const Duration(seconds: 14));
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.mediaErrorRetryCount, 1);
+  });
+
+  testWidgets('native next rebases the silent freeze timeout and timestamps',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.fakePlayer.position = const Duration(seconds: 100);
+    controller.onPlayingChanged(true);
+    await tester.pump(const Duration(seconds: 14));
+
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _originalUrls.map(Media.new).toList(),
+      index: 1,
+    );
+    controller.fakePlayer.position = Duration.zero;
+    controller.syncPlayLine();
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump(const Duration(seconds: 14));
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(controller.currentLineIndex, 1);
+    expect(controller.fakePlayer.jumpedIndexes, [1]);
+    expect(controller.mediaErrorRetryCount, 1);
+  });
+
+  testWidgets('ten healthy samples clear earlier short buffering',
+      (tester) async {
+    final controller = createController(_TestLiveSite())
+      ..mediaErrorRetryCount = 2;
+    controller.fakePlayer.buffering = true;
+    controller.onBufferingChanged(true);
+    await tester.pump(const Duration(seconds: 3));
+
+    controller.fakePlayer.buffering = false;
+    controller.onBufferingChanged(false);
+    await advancePlayback(tester, controller, 10);
+    expect(controller.mediaErrorRetryCount, 0);
+    controller.fakePlayer.buffering = true;
+    controller.onBufferingChanged(true);
+    await tester.pump(const Duration(seconds: 14));
+
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+  });
+
+  testWidgets('duplicate player events cannot postpone stall recovery',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.fakePlayer.buffering = true;
+    controller.onBufferingChanged(true);
+
+    for (var second = 0; second < 14; second += 1) {
+      await tester.pump(const Duration(seconds: 1));
+      controller.onPlayingChanged(true);
+      controller.onBufferingChanged(true);
+      expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    }
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(controller.fakePlayer.jumpedIndexes, [0]);
+  });
+
+  testWidgets('paused playback ignores a stale buffering flag', (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.fakePlayer.buffering = true;
+    controller.onBufferingChanged(true);
+    await tester.pump(const Duration(seconds: 14));
+
+    controller.fakePlayer.playing = false;
+    controller.onPlayingChanged(false);
+    controller.onBufferingChanged(true);
+    await tester.pump(const Duration(seconds: 30));
+
+    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.playing, isFalse);
+    expect(controller.mediaErrorRetryCount, 0);
+  });
+
+  for (final close in [false, true]) {
+    testWidgets(
+        '${close ? 'closing' : 'backgrounding'} cancels the silent stall observer',
+        (tester) async {
+      final site = _TestLiveSite();
+      final controller = createController(site);
+      controller.fakePlayer.buffering = true;
+      controller.onBufferingChanged(true);
+      await tester.pump(const Duration(seconds: 14));
+
+      if (close) {
+        controller.onDelete();
+      } else {
+        controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+      }
+      await tester.pump(const Duration(seconds: 30));
+
+      expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+      expect(controller.fakePlayer.openedUris, isEmpty);
+      expect(site.detailRequests, 0);
+      expect(site.urlRequests, 0);
+    });
+  }
+
+  testWidgets('silent failures remain observed after open and each retry jump',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site);
+
+    await controller.getPlayUrl();
+    await tester.pump(const Duration(seconds: 15));
+    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.mediaErrorRetryCount, 1);
+    await tester.pump(const Duration(seconds: 15));
+    expect(controller.mediaErrorRetryCount, 2);
+    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    await tester.pump(const Duration(seconds: 1));
+    expect(controller.fakePlayer.jumpedIndexes, [0, 0]);
+    await tester.pump(const Duration(seconds: 15));
+
+    expect(site.detailRequests, 1);
+    expect(site.urlRequests, 2);
+    expect(controller.fakePlayer.openedPlaylists, hasLength(2));
+    expect(controller.mediaErrorRetryCount, 3);
+  });
+
+  testWidgets('healthy playback restores the initial reconnect backoff',
+      (tester) async {
+    final site = _TestLiveSite();
+    final controller = createController(site, line: 1)
+      ..mediaErrorRetryCount = 3;
+
+    await completePlayback(controller);
+    await tester.pump(const Duration(seconds: 2));
+    expect(site.detailRequests, 1);
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _refreshedUrls.map(Media.new).toList(),
+      index: 1,
+    );
+    controller.syncPlayLine();
+    await completePlayback(controller);
+    await tester.pump(const Duration(seconds: 3));
+    expect(site.detailRequests, 1);
+    await tester.pump(const Duration(seconds: 1));
+    expect(site.detailRequests, 2);
+
+    await advancePlayback(tester, controller, 10);
+    expect(controller.mediaErrorRetryCount, 0);
+    controller.mediaErrorRetryCount = 3;
+    controller.fakePlayer.currentPlaylist = Playlist(
+      _refreshedUrls.map(Media.new).toList(),
+      index: 1,
+    );
+    controller.syncPlayLine();
+    await completePlayback(controller);
+    await tester.pump(const Duration(seconds: 1));
+    expect(site.detailRequests, 2);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(site.detailRequests, 3);
   });
 
   testWidgets('resume replaces a URL request interrupted by the background',
