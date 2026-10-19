@@ -103,7 +103,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   DateTime? _enterBackgroundTime;
 
   /// 返回前台后，后台停留超过该时长则强制重新拉取直播流
-  /// 直播地址通常带有时效签名，长时间挂后台后旧连接会失效或落后于真实进度
+  /// 长时间挂后台后连接可能被系统挂起或落后于直播进度。
   static const Duration _backgroundReloadThreshold = Duration(seconds: 5);
 
   /// 返回前台后延迟重连弹幕，等待 Android 网络与 DNS 恢复
@@ -120,16 +120,16 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
   int? _streamLoadGeneration;
   int? _mediaRecoveryGeneration;
-  Timer? _playbackHealthTimer;
-  int? _playbackHealthGeneration;
-  bool _playbackHealthInterrupted = false;
+  static const int _maxPlaybackRetries = 3;
+  bool _playbackRecoveryStopped = false;
+  Timer? _playbackStableTimer;
+  int? _playbackStableGeneration;
+  bool _playbackStabilityInterrupted = false;
   bool _resumeStreamPending = false;
   int? _pendingPlaybackFailureGeneration;
   String? _pendingPlaybackError;
   Timer? _playbackErrorTimer;
   Completer<void>? _playbackErrorCheck;
-  Timer? _streamReconnectTimer;
-  int _streamReconnectAttempt = 0;
   StreamSubscription<Playlist>? _playlistSubscription;
 
   @override
@@ -153,7 +153,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     if (currentLineIndex != playlist.index) {
       currentLineIndex = playlist.index;
       currentLineInfo.value = "线路${currentLineIndex + 1}";
-      _playbackHealthInterrupted = true;
+      _playbackStabilityInterrupted = true;
     }
   }
 
@@ -186,14 +186,19 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     }
   }
 
-  void _cancelPlaybackRecovery({bool resetBackoff = true}) {
+  void _cancelPlaybackRecovery() {
     _cancelPlaybackErrorCheck();
-    _cancelPlaybackHealthCheck();
-    _streamReconnectTimer?.cancel();
-    _streamReconnectTimer = null;
-    if (resetBackoff) {
-      _streamReconnectAttempt = 0;
-    }
+    _cancelPlaybackStabilityCheck();
+  }
+
+  void _resetPlaybackRecovery() {
+    _cancelPlaybackRecovery();
+    _playbackRecoveryStopped = false;
+    mediaErrorRetryCount = 0;
+    _resumeStreamPending = false;
+    _pendingPlaybackFailureGeneration = null;
+    _pendingPlaybackError = null;
+    errorMsg.value = "";
   }
 
   bool get _isChangingStream =>
@@ -382,10 +387,10 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
   /// 加载直播间信息
   Future<void> loadData() async {
-    _cancelPlaybackRecovery();
+    _resetPlaybackRecovery();
     final generation = ++_streamOperationGeneration;
     _streamLoadGeneration = generation;
-    _cancelPlaybackHealthCheck();
+    _cancelPlaybackStabilityCheck();
     try {
       SmartDialog.showLoading(msg: "");
       loadError.value = false;
@@ -477,7 +482,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     bool resetRetryCount = true,
   }) async {
     if (operationGeneration == null) {
-      _cancelPlaybackRecovery();
+      _resetPlaybackRecovery();
     }
     final generation = operationGeneration ?? ++_streamOperationGeneration;
     if (!_isStreamOperationCurrent(generation)) {
@@ -486,7 +491,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     if (operationGeneration == null) {
       _streamLoadGeneration = generation;
     }
-    _cancelPlaybackHealthCheck();
+    _cancelPlaybackStabilityCheck();
     final selectedQuality = currentQualityInfo.value;
 
     try {
@@ -561,14 +566,14 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   /// 获取播放地址并初始化播放列表。
   ///
   /// [resetRetryCount] 为 true 时重置错误重试计数（正常首播/切清晰度场景）；
-  /// 由错误重试触发时应传 false，以保留计数，避免陷入无限重试而无法切换线路。
+  /// 由错误恢复触发时应传 false，避免刷新地址后重新补满重试预算。
   Future<void> getPlayUrl({
     bool resetRetryCount = true,
     int? operationGeneration,
     bool preserveLine = false,
   }) async {
     if (operationGeneration == null) {
-      _cancelPlaybackRecovery();
+      _resetPlaybackRecovery();
     }
     final generation = operationGeneration ?? ++_streamOperationGeneration;
     if (!_isStreamOperationCurrent(generation) ||
@@ -580,7 +585,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     if (operationGeneration == null) {
       _streamLoadGeneration = generation;
     }
-    _cancelPlaybackHealthCheck();
+    _cancelPlaybackStabilityCheck();
     final quality = qualites[currentQuality];
     final previousLineIndex = currentLineIndex;
     try {
@@ -627,14 +632,14 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       return;
     }
     if (operationGeneration == null) {
-      _cancelPlaybackRecovery();
+      _resetPlaybackRecovery();
     }
     final generation = operationGeneration ?? ++_streamOperationGeneration;
     if (!_isStreamOperationCurrent(generation)) {
       return;
     }
     _streamLoadGeneration = generation;
-    _cancelPlaybackHealthCheck();
+    _cancelPlaybackStabilityCheck();
     currentLineIndex = index;
     //重置错误次数
     mediaErrorRetryCount = 0;
@@ -710,7 +715,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   @override
   Future<void> mediaEnd() async {
     // completed 流可能仍在派发旧连接事件，以播放器的当前状态为准。
-    if (player.state.completed) {
+    if (!_playbackRecoveryStopped && player.state.completed) {
       _cancelPlaybackErrorCheck();
       await _recoverPlayback();
     }
@@ -719,7 +724,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   int mediaErrorRetryCount = 0;
   @override
   Future<void> mediaError(String error) {
-    if (isClosed || !liveStatus.value) {
+    if (isClosed || !liveStatus.value || _playbackRecoveryStopped) {
       return Future<void>.value();
     }
     if (_isChangingStream || player.state.completed) {
@@ -749,6 +754,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         Timer.periodic(const Duration(seconds: 1), (timer) async {
       if (!_isStreamOperationCurrent(generation) ||
           !liveStatus.value ||
+          _playbackRecoveryStopped ||
           (!player.state.completed && !player.state.playing)) {
         _cancelPlaybackErrorCheck();
         return;
@@ -790,10 +796,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   }
 
   Future<void> _recoverPlayback({String? error}) async {
-    if (isClosed || !liveStatus.value) {
-      return;
-    }
-    if (_streamReconnectTimer != null) {
+    if (isClosed || !liveStatus.value || _playbackRecoveryStopped) {
       return;
     }
     if (_isChangingStream) {
@@ -804,7 +807,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       _pendingPlaybackError ??= error;
       return;
     }
-    _cancelPlaybackHealthCheck();
+    _cancelPlaybackStabilityCheck();
     if (isBackground) {
       _resumeStreamPending = true;
       return;
@@ -814,50 +817,54 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     final generation = ++_streamOperationGeneration;
     _mediaRecoveryGeneration = generation;
     try {
-      if (mediaErrorRetryCount < 3) {
+      while (_isStreamOperationCurrent(generation)) {
+        if (mediaErrorRetryCount >= _maxPlaybackRetries) {
+          await _stopPlaybackRecovery(generation);
+          return;
+        }
         mediaErrorRetryCount += 1;
         Log.d("直播流断开，重试次数：$mediaErrorRetryCount，原因：${error ?? '播放结束'}");
-        if (mediaErrorRetryCount == 2) {
-          final position = player.state.position;
-          final lineIndex = player.state.playlist.index;
-          await Future<void>.delayed(const Duration(seconds: 1));
+        try {
+          if (mediaErrorRetryCount == 2) {
+            final position = player.state.position;
+            final lineIndex = player.state.playlist.index;
+            await Future<void>.delayed(const Duration(seconds: 1));
+            if (!_isStreamOperationCurrent(generation)) {
+              return;
+            }
+            final state = player.state;
+            final changedLine = state.playlist.index != lineIndex &&
+                state.playlist.index >= 0 &&
+                state.playlist.index < playUrls.length &&
+                _matchesPlayUrls(state.playlist);
+            if (state.playing &&
+                !state.completed &&
+                (state.position > position || changedLine)) {
+              Log.d("等待重试期间播放已恢复或原生已切线，保留当前连接");
+              return;
+            }
+          }
           if (!_isStreamOperationCurrent(generation)) {
             return;
           }
-          final state = player.state;
-          final changedLine = state.playlist.index != lineIndex &&
-              state.playlist.index >= 0 &&
-              state.playlist.index < playUrls.length &&
-              _matchesPlayUrls(state.playlist);
-          if (state.playing &&
-              !state.completed &&
-              (state.position > position || changedLine)) {
-            Log.d("等待重试期间播放已恢复或原生已切线，保留当前连接");
+          if (mediaErrorRetryCount <= 2 &&
+              currentLineIndex >= 0 &&
+              currentLineIndex < playUrls.length) {
+            await _jumpToPlayLine(generation);
+          } else {
+            await _refreshPlaybackData(generation, preserveLine: true);
+          }
+          return;
+        } catch (failure) {
+          if (!_isStreamOperationCurrent(generation)) {
             return;
           }
+          Log.logPrint(failure);
+          addSysMsg("恢复播放失败：$failure");
+          // 本次操作已明确失败，丢弃其回调，再使用剩余的有限重试预算。
+          _pendingPlaybackFailureGeneration = null;
+          _pendingPlaybackError = null;
         }
-        if (!_isStreamOperationCurrent(generation)) {
-          return;
-        }
-        if (mediaErrorRetryCount <= 2 &&
-            currentLineIndex >= 0 &&
-            currentLineIndex < playUrls.length) {
-          await _jumpToPlayLine(generation);
-        } else {
-          await _refreshPlaybackData(generation, preserveLine: true);
-        }
-      } else if (currentLineIndex >= 0 &&
-          currentLineIndex + 1 < playUrls.length) {
-        await changePlayLine(currentLineIndex + 1,
-            operationGeneration: generation);
-      } else {
-        _scheduleStreamReconnect(generation);
-      }
-    } catch (failure) {
-      if (_isStreamOperationCurrent(generation)) {
-        Log.logPrint(failure);
-        addSysMsg("恢复播放失败：$failure");
-        _scheduleStreamReconnect(generation);
       }
     } finally {
       if (_mediaRecoveryGeneration == generation) {
@@ -869,6 +876,27 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         await WakelockPlus.disable();
       }
       _checkPendingPlaybackFailure(_streamOperationGeneration);
+    }
+  }
+
+  Future<void> _stopPlaybackRecovery(int generation, {String? message}) async {
+    if (!_isStreamOperationCurrent(generation)) {
+      return;
+    }
+    // 先锁定，避免 stop 产生的结束或错误事件再次启动恢复。
+    _playbackRecoveryStopped = true;
+    _resumeStreamPending = false;
+    _cancelPlaybackRecovery();
+    _pendingPlaybackFailureGeneration = null;
+    _pendingPlaybackError = null;
+    errorMsg.value = message ?? "直播流已断开，已自动重试$_maxPlaybackRetries次，请手动刷新";
+    try {
+      await player.stop();
+    } catch (failure) {
+      Log.logPrint(failure);
+    }
+    if (_isStreamOperationCurrent(generation)) {
+      await WakelockPlus.disable();
     }
   }
 
@@ -897,75 +925,10 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     );
   }
 
-  void _scheduleStreamReconnect(int generation) {
-    if (!_isStreamOperationCurrent(generation) ||
-        !liveStatus.value ||
-        _streamReconnectTimer != null) {
+  void _checkPendingPlaybackFailure(int generation) {
+    if (_playbackRecoveryStopped) {
       return;
     }
-    final delaySeconds = 2 << _streamReconnectAttempt.clamp(0, 4);
-    _streamReconnectAttempt += 1;
-    errorMsg.value = "直播连接中断，正在重新连接";
-    Log.d("直播流将在$delaySeconds 秒后重新获取房间和播放数据");
-    var remainingChecks = delaySeconds;
-    var position = player.state.position;
-    var lineIndex = player.state.playlist.index;
-    var usedTimelineGrace = false;
-    _streamReconnectTimer =
-        Timer.periodic(const Duration(seconds: 1), (timer) async {
-      if (!_isStreamOperationCurrent(generation)) {
-        timer.cancel();
-        _streamReconnectTimer = null;
-        return;
-      }
-      final state = player.state;
-      final sameLine = state.playlist.index == lineIndex;
-      final advancing = sameLine && state.position > position;
-      final timelineChanged = !sameLine || state.position < position;
-      position = state.position;
-      lineIndex = state.playlist.index;
-      if (state.playing && !state.completed && advancing) {
-        timer.cancel();
-        _streamReconnectTimer = null;
-        errorMsg.value = "";
-        Log.d("等待重连期间播放已恢复，取消刷新地址");
-        syncPlayLine();
-        onPlayingChanged(true);
-        return;
-      }
-      remainingChecks -= 1;
-      if (remainingChecks > 0) {
-        return;
-      }
-      // 原生切线会重置时间戳，截止时多观察一次，避免抢先重开新连接。
-      if (!usedTimelineGrace &&
-          timelineChanged &&
-          state.playing &&
-          !state.completed) {
-        usedTimelineGrace = true;
-        return;
-      }
-      timer.cancel();
-      _streamReconnectTimer = null;
-      final reconnectGeneration = ++_streamOperationGeneration;
-      _mediaRecoveryGeneration = reconnectGeneration;
-      try {
-        await _refreshPlaybackData(reconnectGeneration);
-      } catch (failure) {
-        if (_isStreamOperationCurrent(reconnectGeneration)) {
-          Log.logPrint(failure);
-          _scheduleStreamReconnect(reconnectGeneration);
-        }
-      } finally {
-        if (_mediaRecoveryGeneration == reconnectGeneration) {
-          _mediaRecoveryGeneration = null;
-        }
-        _checkPendingPlaybackFailure(reconnectGeneration);
-      }
-    });
-  }
-
-  void _checkPendingPlaybackFailure(int generation) {
     if (_isStreamOperationCurrent(generation)) {
       // 切流期间忽略的播放列表事件，在操作完成后按当前状态补同步。
       syncPlayLine();
@@ -994,45 +957,40 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   void onPlayingChanged(bool playing) {
     if (!playing ||
         !liveStatus.value ||
+        _playbackRecoveryStopped ||
+        mediaErrorRetryCount == 0 ||
         !_isStreamOperationCurrent(_streamOperationGeneration) ||
         _isChangingStream ||
-        _streamReconnectTimer != null ||
         errorMsg.value.isNotEmpty) {
-      _cancelPlaybackHealthCheck();
+      _cancelPlaybackStabilityCheck();
       return;
     }
-    if (_playbackHealthTimer != null &&
-        _playbackHealthGeneration == _streamOperationGeneration) {
+    if (_playbackStableTimer != null &&
+        _playbackStableGeneration == _streamOperationGeneration) {
       return;
     }
-    _cancelPlaybackHealthCheck();
+    _cancelPlaybackStabilityCheck();
     final generation = _streamOperationGeneration;
-    _playbackHealthGeneration = generation;
+    _playbackStableGeneration = generation;
     var position = player.state.position;
     var lineIndex = player.state.playlist.index;
     var stableChecks = 0;
-    var stalledChecks = 0;
-    // 只有连续停止推进才重连；短暂缓冲不能累计打断仍在播放的连接。
-    _playbackHealthTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+    // 此处只恢复重试预算；没有明确错误或结束事件时，绝不主动重载。
+    _playbackStableTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (!_isStreamOperationCurrent(generation) ||
           !liveStatus.value ||
+          _playbackRecoveryStopped ||
           !player.state.playing ||
           _isChangingStream ||
-          _streamReconnectTimer != null ||
           errorMsg.value.isNotEmpty) {
-        _cancelPlaybackHealthCheck();
+        _cancelPlaybackStabilityCheck();
         return;
       }
       final state = player.state;
       final sameLine = state.playlist.index == lineIndex;
       final advancing = state.position > position;
-      final interrupted = _playbackHealthInterrupted;
-      _playbackHealthInterrupted = false;
-      if (!sameLine || advancing) {
-        stalledChecks = 0;
-      } else {
-        stalledChecks += 1;
-      }
+      final interrupted = _playbackStabilityInterrupted;
+      _playbackStabilityInterrupted = false;
       if (sameLine &&
           !interrupted &&
           advancing &&
@@ -1041,33 +999,28 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         stableChecks += 1;
         if (stableChecks >= 10) {
           mediaErrorRetryCount = 0;
-          _streamReconnectAttempt = 0;
+          _cancelPlaybackStabilityCheck();
         }
       } else {
         stableChecks = 0;
       }
       position = state.position;
       lineIndex = state.playlist.index;
-      if (stalledChecks >= 15) {
-        _cancelPlaybackHealthCheck();
-        Log.d("直播连续15秒未推进，开始恢复播放");
-        unawaited(_recoverPlayback(error: "直播连续15秒未推进"));
-      }
     });
   }
 
-  void _cancelPlaybackHealthCheck() {
-    _playbackHealthTimer?.cancel();
-    _playbackHealthTimer = null;
-    _playbackHealthGeneration = null;
-    _playbackHealthInterrupted = false;
+  void _cancelPlaybackStabilityCheck() {
+    _playbackStableTimer?.cancel();
+    _playbackStableTimer = null;
+    _playbackStableGeneration = null;
+    _playbackStabilityInterrupted = false;
   }
 
   @override
   void onBufferingChanged(bool buffering) {
     onPlayingChanged(player.state.playing);
-    if (buffering && _playbackHealthTimer != null) {
-      _playbackHealthInterrupted = true;
+    if (buffering && _playbackStableTimer != null) {
+      _playbackStabilityInterrupted = true;
     }
   }
 
@@ -1555,7 +1508,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     _cancelPlaybackRecovery();
     final generation = ++_streamOperationGeneration;
     _streamLoadGeneration = generation;
-    _cancelPlaybackHealthCheck();
+    _cancelPlaybackStabilityCheck();
     _danmakuResumeTimer?.cancel();
     _danmakuResumeTimer = null;
     rxSite.value = site;
@@ -1599,12 +1552,11 @@ $_loadErrorStackTrace''');
       danmakuController?.clear();
       _resumeStreamPending = _resumeStreamPending ||
           _isChangingStream ||
-          _streamReconnectTimer != null ||
           _playbackErrorTimer != null;
-      _cancelPlaybackRecovery(resetBackoff: false);
+      _cancelPlaybackRecovery();
       isBackground = true;
       _streamOperationGeneration += 1;
-      _cancelPlaybackHealthCheck();
+      _cancelPlaybackStabilityCheck();
       _enterBackgroundTime = DateTime.now();
       _danmakuResumeTimer?.cancel();
       _danmakuResumeTimer = null;
@@ -1654,13 +1606,17 @@ $_loadErrorStackTrace''');
 
   /// 返回前台后处理直播流恢复。
   ///
-  /// 直播地址带有时效签名，App 挂后台期间连接可能被系统挂起或地址失效，
-  /// 播放器若继续使用旧连接会停留在过期缓冲、落后于真实直播进度，
-  /// 表现为画面卡住或视频流被截断。因此后台停留超过阈值时重新读取直播间详情，
-  /// 生成新的签名、清晰度数据和播放地址后重开播放器。
+  /// 后台连接可能被系统挂起或落后于实时进度，超过阈值时重新读取播放数据。
+  /// 自动恢复已停止时，仅恢复弹幕，等待用户手动刷新播放。
   Future<void> _handleResumeFromBackground() async {
     final enterTime = _enterBackgroundTime;
     _enterBackgroundTime = null;
+
+    if (_playbackRecoveryStopped) {
+      _resumeStreamPending = false;
+      _restartDanmakuAfterResume();
+      return;
+    }
 
     if (enterTime == null) {
       _restartDanmakuAfterResume();
@@ -1683,7 +1639,8 @@ $_loadErrorStackTrace''');
 
   /// 重新读取直播间详情并重开播放器，用于刷新平台签名和追赶直播进度。
   Future<void> _reloadRoomAfterBackground(int operationGeneration) async {
-    if (!_isStreamOperationCurrent(operationGeneration)) {
+    if (!_isStreamOperationCurrent(operationGeneration) ||
+        _playbackRecoveryStopped) {
       return;
     }
 
@@ -1695,7 +1652,8 @@ $_loadErrorStackTrace''');
       if (_isStreamOperationCurrent(operationGeneration)) {
         Log.logPrint(error);
         addSysMsg("恢复直播失败：$error");
-        _scheduleStreamReconnect(operationGeneration);
+        await _stopPlaybackRecovery(operationGeneration,
+            message: "恢复直播失败，请手动刷新");
       }
     } finally {
       if (_backgroundReloadGeneration == operationGeneration) {
@@ -1750,7 +1708,7 @@ $_loadErrorStackTrace''');
     _playlistSubscription = null;
     _streamOperationGeneration += 1;
     _backgroundReloadGeneration = null;
-    _cancelPlaybackHealthCheck();
+    _cancelPlaybackStabilityCheck();
     _danmakuResumeTimer?.cancel();
     _danmakuResumeTimer = null;
     liveDanmaku.stop();
