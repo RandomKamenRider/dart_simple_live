@@ -54,6 +54,27 @@ mixin PlayerMixin {
     }
   }
 
+  Future<void> selectLivePlaylistLine(
+    int index, {
+    required bool Function() isCurrent,
+  }) async {
+    final native = player.platform as NativePlayer;
+    // Share media_kit's lock with open/stop/dispose and recheck ownership after
+    // waiting. jump() calls play(), which seeks to zero and selects item 0 at EOF.
+    await NativePlayer.lock.synchronized(() async {
+      if (!isCurrent()) {
+        return;
+      }
+      // A manual line selection also resumes a paused player. Let START_FILE
+      // publish playing/completed instead of calling play() on the ended stream.
+      native.isPlayingStateChangeAllowed = true;
+      await native.command(['playlist-play-index', '$index']);
+      if (isCurrent()) {
+        await native.setProperty('pause', 'no');
+      }
+    });
+  }
+
   /// 视频控制器
   late final videoController = VideoController(
     player,

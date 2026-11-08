@@ -698,8 +698,11 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       await initPlaylist(operationGeneration: generation);
       return;
     }
-    // 沿用原版在现有播放列表中重试，不重新请求地址或卸载整个列表。
-    await player.jump(currentLineIndex);
+    // Restart the selected live entry without seeking the ended stream.
+    await selectLivePlaylistLine(
+      currentLineIndex,
+      isCurrent: () => _isStreamOperationCurrent(generation),
+    );
   }
 
   Future<void> setPlayer() async {

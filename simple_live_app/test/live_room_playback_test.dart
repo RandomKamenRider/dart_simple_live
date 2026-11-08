@@ -142,7 +142,7 @@ void main() {
     expect(playlist.medias.map((media) => media.uri), _originalUrls);
     expect(
         playlist.medias.map((media) => media.httpHeaders), [headers, headers]);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.currentLineIndex, 1);
     expect(site.urlRequests, 1);
   });
@@ -161,9 +161,9 @@ void main() {
     expect(controller.currentLineIndex, 1);
     expect(controller.mediaErrorRetryCount, 2);
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     await completePlayback(controller);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, [_refreshedUrls.last]);
     expect(controller.mediaErrorRetryCount, 3);
     expect(site.urlRequests, 1);
@@ -187,7 +187,7 @@ void main() {
     expect(controller.mediaErrorRetryCount, 2);
     await advancePlayback(tester, controller, 1);
     expect(controller.mediaErrorRetryCount, 0);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
   });
 
   testWidgets('native line changes interrupt consecutive healthy samples',
@@ -209,7 +209,7 @@ void main() {
     await advancePlayback(tester, controller, 1);
 
     expect(controller.mediaErrorRetryCount, 0);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
   });
 
   testWidgets(
@@ -248,7 +248,7 @@ void main() {
     expect(controller.currentLineIndex, 1);
     expect(controller.fakePlayer.currentPlaylist.index, 1);
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(site.detailRequests, 0);
     expect(site.urlRequests, 0);
   });
@@ -258,7 +258,7 @@ void main() {
     final controller = createController(_TestLiveSite(), line: 1);
     int? lineDuringJump;
     int? retriesDuringJump;
-    controller.fakePlayer.onJump = () {
+    controller.fakePlayer.onSelect = () {
       final targetPlaylist = controller.fakePlayer.currentPlaylist;
       controller.fakePlayer.currentPlaylist = Playlist(targetPlaylist.medias);
       controller.syncPlayLine();
@@ -274,7 +274,7 @@ void main() {
     expect(controller.currentLineIndex, 1);
     expect(controller.fakePlayer.currentPlaylist.index, 1);
     expect(controller.mediaErrorRetryCount, 1);
-    expect(controller.fakePlayer.jumpedIndexes, [1]);
+    expect(controller.fakePlayer.selectedIndexes, [1]);
   });
 
   for (final missingPlaylist in [false, true]) {
@@ -292,7 +292,7 @@ void main() {
       final playlist = controller.fakePlayer.openedPlaylists.single;
       expect(playlist.medias.map((media) => media.uri), _originalUrls);
       expect(playlist.index, 1);
-      expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+      expect(controller.fakePlayer.selectedIndexes, isEmpty);
       expect(controller.currentLineIndex, 1);
       expect(site.detailRequests, 0);
       expect(site.urlRequests, 0);
@@ -321,7 +321,7 @@ void main() {
     expect(controller.currentLineIndex, 1);
     expect(controller.fakePlayer.currentPlaylist.index, 1);
     expect(controller.fakePlayer.openedPlaylists, hasLength(1));
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(site.urlRequests, 1);
     expect(site.detailRequests, 0);
     expect(controller.mediaErrorRetryCount, 0);
@@ -352,7 +352,7 @@ void main() {
     await error;
 
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.mediaErrorRetryCount, 0);
     expect(site.urlRequests, 0);
     expect(controller.liveStatus.value, isTrue);
@@ -372,7 +372,7 @@ void main() {
     await Future.wait([error, duplicate]);
 
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     expect(controller.mediaErrorRetryCount, 1);
     expect(site.urlRequests, 0);
     expect(site.detailRequests, 0);
@@ -390,7 +390,7 @@ void main() {
     await error;
 
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     expect(controller.mediaErrorRetryCount, 1);
   });
 
@@ -406,7 +406,7 @@ void main() {
     }
     await error;
 
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     expect(controller.mediaErrorRetryCount, 1);
   });
 
@@ -420,7 +420,7 @@ void main() {
     await advancePlayback(tester, controller, 5);
     await error;
 
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.mediaErrorRetryCount, 2);
     expect(site.detailRequests, 0);
@@ -442,12 +442,12 @@ void main() {
     controller.syncPlayLine();
     await tester.pump(const Duration(seconds: 1));
     await tester.pump(const Duration(seconds: 4));
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     await tester.pump(const Duration(seconds: 1));
     await warning;
 
     expect(controller.currentLineIndex, 1);
-    expect(controller.fakePlayer.jumpedIndexes, [1]);
+    expect(controller.fakePlayer.selectedIndexes, [1]);
     expect(controller.mediaErrorRetryCount, 1);
   });
 
@@ -473,12 +473,58 @@ void main() {
     await completePlayback(controller);
 
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [1]);
+    expect(controller.fakePlayer.selectedIndexes, [1]);
     expect(controller.currentLineIndex, 1);
     expect(controller.mediaErrorRetryCount, 1);
+    expect(controller.fakePlayer.native.commands, [
+      ['playlist-play-index', '1'],
+    ]);
+    expect(controller.fakePlayer.native.properties, {'pause': 'no'});
+    expect(
+        controller.fakePlayer.currentPlaylist.medias.map((media) => media.uri),
+        _originalUrls);
+    expect(controller.fakePlayer.completed, isFalse);
     expect(site.detailRequests, 0);
     expect(site.urlRequests, 0);
     expect(controller.liveStatus.value, isTrue);
+  });
+
+  testWidgets('a manual line selection resumes paused playback without seek',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    controller.fakePlayer.playing = false;
+
+    await controller.changePlayLine(1);
+
+    expect(controller.fakePlayer.native.commands, [
+      ['playlist-play-index', '1'],
+    ]);
+    expect(controller.fakePlayer.playing, isTrue);
+    expect(controller.fakePlayer.native.isPlayingStateChangeAllowed, isTrue);
+    expect(controller.fakePlayer.openedUris, isEmpty);
+  });
+
+  testWidgets('a cancelled native selection does not send a command',
+      (tester) async {
+    final controller = createController(_TestLiveSite());
+    final entered = Completer<void>();
+    final release = Completer<void>();
+    final held = NativePlayer.lock.synchronized(() async {
+      entered.complete();
+      await release.future;
+    });
+    await entered.future;
+    var current = true;
+    final selection =
+        controller.selectLivePlaylistLine(1, isCurrent: () => current);
+    current = false;
+    release.complete();
+    await held;
+    await selection;
+
+    expect(controller.fakePlayer.native.commands, isEmpty);
+    expect(controller.fakePlayer.native.properties, isEmpty);
+    expect(controller.fakePlayer.native.isPlayingStateChangeAllowed, isFalse);
   });
 
   testWidgets(
@@ -489,12 +535,12 @@ void main() {
       ..mediaErrorRetryCount = 1;
 
     final retry = completePlayback(controller);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     await tester.pump(const Duration(seconds: 1));
     await retry;
 
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [1]);
+    expect(controller.fakePlayer.selectedIndexes, [1]);
     expect(controller.mediaErrorRetryCount, 2);
     expect(site.detailRequests, 0);
     expect(site.urlRequests, 0);
@@ -514,7 +560,7 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
     await retry;
 
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.mediaErrorRetryCount, 2);
     expect(controller.currentLineIndex, 0);
@@ -538,7 +584,7 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
     await retry;
 
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.mediaErrorRetryCount, 2);
     expect(controller.currentLineIndex, 1);
@@ -556,7 +602,7 @@ void main() {
     await tester.pump(const Duration(seconds: 6));
 
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     expect(controller.mediaErrorRetryCount, 1);
   });
 
@@ -566,7 +612,7 @@ void main() {
     final controller = createController(site);
     final oldWarning = controller.mediaError('old connection warning');
     var firstOpen = true;
-    controller.fakePlayer.onJump = () {
+    controller.fakePlayer.onSelect = () {
       if (firstOpen) {
         firstOpen = false;
         unawaited(controller.mediaError('new connection failed to advance'));
@@ -577,14 +623,14 @@ void main() {
     await controller.mediaError('completed connection');
     await oldWarning;
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     await tester.pump(const Duration(seconds: 5));
     expect(controller.mediaErrorRetryCount, 2);
     await tester.pump(const Duration(seconds: 1));
 
     expect(site.detailRequests, 0);
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [0, 0]);
+    expect(controller.fakePlayer.selectedIndexes, [0, 0]);
   });
 
   testWidgets('continuous failure refreshes room signatures quality and URLs',
@@ -628,7 +674,7 @@ void main() {
     expect(controller.currentLineIndex, 1);
     expect(controller.mediaErrorRetryCount, 0);
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [1]);
+    expect(controller.fakePlayer.selectedIndexes, [1]);
   });
 
   testWidgets('manual selection invalidates an already pending room refresh',
@@ -648,7 +694,7 @@ void main() {
     expect(site.urlRequests, 0);
     expect(controller.currentLineIndex, 1);
     expect(controller.fakePlayer.openedUris, isEmpty);
-    expect(controller.fakePlayer.jumpedIndexes, [1]);
+    expect(controller.fakePlayer.selectedIndexes, [1]);
   });
 
   testWidgets(
@@ -661,7 +707,7 @@ void main() {
     final secondRetry = completePlayback(controller);
     await tester.pump(const Duration(seconds: 1));
     await secondRetry;
-    expect(controller.fakePlayer.jumpedIndexes, [0, 0]);
+    expect(controller.fakePlayer.selectedIndexes, [0, 0]);
     await completePlayback(controller);
 
     expect(controller.mediaErrorRetryCount, 3);
@@ -682,7 +728,7 @@ void main() {
     }
     await tester.pump(const Duration(minutes: 3));
 
-    expect(controller.fakePlayer.jumpedIndexes, [0, 0]);
+    expect(controller.fakePlayer.selectedIndexes, [0, 0]);
     expect(controller.fakePlayer.openedUris, [_refreshedUrls.first]);
     expect(controller.fakePlayer.stopCalls, 1);
     expect(controller.mediaErrorRetryCount, 3);
@@ -702,7 +748,7 @@ void main() {
     await tester.pump(const Duration(minutes: 3));
 
     expect(controller.currentLineIndex, 0);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.fakePlayer.stopCalls, 1);
     expect(controller.liveStatus.value, isTrue);
@@ -728,7 +774,7 @@ void main() {
     await failed;
 
     expect(controller.fakePlayer.stopCalls, 1);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.mediaErrorRetryCount, 3);
     expect(controller.errorMsg.value, contains('手动刷新'));
@@ -752,7 +798,7 @@ void main() {
     expect(controller.mediaErrorRetryCount, 3);
     expect(controller.errorMsg.value, contains('手动刷新'));
     expect(controller.fakePlayer.stopCalls, 1);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(site.detailRequests, 0);
     expect(site.urlRequests, 0);
@@ -763,16 +809,16 @@ void main() {
       (tester) async {
     final site = _TestLiveSite();
     final controller = createController(site);
-    controller.fakePlayer.onJump = () => throw StateError('jump failed');
+    controller.fakePlayer.onSelect = () => throw StateError('jump failed');
     controller.fakePlayer.onOpen = () => throw StateError('open failed');
 
     final recovery = completePlayback(controller);
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     await tester.pump(const Duration(seconds: 1));
     await recovery;
     await tester.pump(const Duration(minutes: 3));
 
-    expect(controller.fakePlayer.jumpedIndexes, [0, 0]);
+    expect(controller.fakePlayer.selectedIndexes, [0, 0]);
     expect(controller.fakePlayer.openedPlaylists, hasLength(1));
     expect(controller.fakePlayer.stopCalls, 1);
     expect(controller.mediaErrorRetryCount, 3);
@@ -805,7 +851,7 @@ void main() {
 
       expect(controller.mediaErrorRetryCount, 3);
       expect(controller.fakePlayer.stopCalls, 1);
-      expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+      expect(controller.fakePlayer.selectedIndexes, isEmpty);
       expect(controller.liveStatus.value, isTrue);
       expect(controller.errorMsg.value, contains('手动刷新'));
       expect(site.detailRequests, requests);
@@ -827,7 +873,7 @@ void main() {
       }
     }
 
-    controller.fakePlayer.onJump = emitFailures;
+    controller.fakePlayer.onSelect = emitFailures;
     controller.fakePlayer.onOpen = emitFailures;
 
     final recovery = completePlayback(controller);
@@ -836,7 +882,7 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(minutes: 3));
 
-    expect(controller.fakePlayer.jumpedIndexes, [0, 0]);
+    expect(controller.fakePlayer.selectedIndexes, [0, 0]);
     expect(controller.fakePlayer.openedPlaylists, hasLength(1));
     expect(controller.fakePlayer.stopCalls, 1);
     expect(controller.mediaErrorRetryCount, 3);
@@ -860,7 +906,7 @@ void main() {
         await controller.getPlayQualites();
       } else {
         await controller.changePlayLine(1);
-        expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+        expect(controller.fakePlayer.selectedIndexes, isEmpty);
         final playlist = controller.fakePlayer.openedPlaylists.single;
         expect(playlist.index, 1);
         expect(playlist.medias.map((media) => media.uri), _originalUrls);
@@ -873,7 +919,7 @@ void main() {
       await completePlayback(controller);
 
       expect(controller.mediaErrorRetryCount, 1);
-      expect(controller.fakePlayer.jumpedIndexes.last,
+      expect(controller.fakePlayer.selectedIndexes.last,
           controller.currentLineIndex);
       expect(controller.fakePlayer.stopCalls, 1);
       expect(controller.liveStatus.value, isTrue);
@@ -889,7 +935,7 @@ void main() {
     await completePlayback(fresh);
     await stopped.mediaError('old room callback');
 
-    expect(fresh.fakePlayer.jumpedIndexes, [0]);
+    expect(fresh.fakePlayer.selectedIndexes, [0]);
     expect(fresh.mediaErrorRetryCount, 1);
     expect(fresh.fakePlayer.stopCalls, 0);
     expect(stopped.fakePlayer.stopCalls, 1);
@@ -944,7 +990,7 @@ void main() {
 
     expect(site.urlRequests, 1);
     expect(controller.fakePlayer.openedUris, [_refreshedUrls.first]);
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     expect(controller.fakePlayer.completed, isFalse);
     expect(controller.mediaErrorRetryCount, 1);
     expect(controller.liveStatus.value, isTrue);
@@ -968,7 +1014,7 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
 
     expect(controller.fakePlayer.openedUris, [_refreshedUrls.first]);
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     expect(site.urlRequests, 1);
     expect(controller.mediaErrorRetryCount, 1);
   });
@@ -1000,7 +1046,7 @@ void main() {
 
     expect(site.detailRequests, 0);
     expect(site.urlRequests, 0);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
   });
 
@@ -1020,7 +1066,7 @@ void main() {
 
     expect(controller.mediaErrorRetryCount, 3);
     expect(controller.fakePlayer.stopCalls, 1);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.errorMsg.value, contains('手动刷新'));
     expect(controller.liveStatus.value, isTrue);
@@ -1047,7 +1093,7 @@ void main() {
     await completePlayback(controller);
 
     expect(controller.fakePlayer.stopCalls, 1);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.errorMsg.value, contains('手动刷新'));
     expect(controller.liveStatus.value, isTrue);
@@ -1069,8 +1115,8 @@ void main() {
     await Future.wait([warning, retry]);
     await tester.pump(const Duration(minutes: 3));
 
-    expect(observed.fakePlayer.jumpedIndexes, isEmpty);
-    expect(retrying.fakePlayer.jumpedIndexes, isEmpty);
+    expect(observed.fakePlayer.selectedIndexes, isEmpty);
+    expect(retrying.fakePlayer.selectedIndexes, isEmpty);
     expect(retrying.fakePlayer.openedUris, isEmpty);
     expect(retrySite.detailRequests, 0);
     expect(observed.fakePlayer.disposeCalls, 1);
@@ -1100,7 +1146,7 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
 
     expect(controller.mediaErrorRetryCount, 2);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
   });
 
   testWidgets('brief progress followed by a freeze does not restore retries',
@@ -1113,7 +1159,7 @@ void main() {
     await tester.pump(const Duration(seconds: 9));
 
     expect(controller.mediaErrorRetryCount, 2);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
   });
 
   testWidgets('playing without progress does not restore the retry budget',
@@ -1181,7 +1227,7 @@ void main() {
     await advancePlayback(tester, controller, 1);
 
     expect(controller.mediaErrorRetryCount, 0);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
   });
 
   for (final buffering in [false, true]) {
@@ -1196,7 +1242,7 @@ void main() {
 
       await tester.pump(const Duration(minutes: 4));
 
-      expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+      expect(controller.fakePlayer.selectedIndexes, isEmpty);
       expect(controller.fakePlayer.openedUris, isEmpty);
       expect(controller.fakePlayer.stopCalls, 0);
       expect(controller.mediaErrorRetryCount, 2);
@@ -1218,7 +1264,7 @@ void main() {
 
     await tester.pump(const Duration(minutes: 4));
 
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.fakePlayer.stopCalls, 0);
     expect(site.detailRequests, 0);
@@ -1249,7 +1295,7 @@ void main() {
         }
         await advancePlayback(tester, controller, 7);
 
-        expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+        expect(controller.fakePlayer.selectedIndexes, isEmpty);
         expect(controller.fakePlayer.openedUris, isEmpty);
         expect(site.detailRequests, 0);
         expect(site.urlRequests, 0);
@@ -1269,7 +1315,7 @@ void main() {
 
     await advancePlayback(tester, controller, 120);
 
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.mediaErrorRetryCount, 2);
     expect(site.detailRequests, 0);
@@ -1293,7 +1339,7 @@ void main() {
     await tester.pump(const Duration(minutes: 4));
 
     expect(controller.currentLineIndex, 1);
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.fakePlayer.stopCalls, 0);
     expect(controller.mediaErrorRetryCount, 2);
@@ -1317,7 +1363,7 @@ void main() {
     controller.onBufferingChanged(true);
     await tester.pump(const Duration(seconds: 14));
 
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
   });
 
   testWidgets('duplicate playing and buffering events never create a retry',
@@ -1333,7 +1379,7 @@ void main() {
       controller.onBufferingChanged(true);
     }
 
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.openedUris, isEmpty);
     expect(controller.fakePlayer.stopCalls, 0);
     expect(controller.mediaErrorRetryCount, 2);
@@ -1352,7 +1398,7 @@ void main() {
     controller.onBufferingChanged(true);
     await tester.pump(const Duration(seconds: 30));
 
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     expect(controller.fakePlayer.playing, isFalse);
     expect(controller.mediaErrorRetryCount, 0);
   });
@@ -1375,7 +1421,7 @@ void main() {
       await tester.pump(const Duration(minutes: 3));
 
       expect(controller.mediaErrorRetryCount, 2);
-      expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+      expect(controller.fakePlayer.selectedIndexes, isEmpty);
       expect(controller.fakePlayer.openedUris, isEmpty);
       expect(site.detailRequests, 0);
       expect(site.urlRequests, 0);
@@ -1389,22 +1435,22 @@ void main() {
 
     await controller.getPlayUrl();
     await tester.pump(const Duration(minutes: 3));
-    expect(controller.fakePlayer.jumpedIndexes, isEmpty);
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
     await completePlayback(controller);
     await tester.pump(const Duration(minutes: 3));
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     expect(controller.mediaErrorRetryCount, 1);
 
     final secondRetry = completePlayback(controller);
     await tester.pump(const Duration(seconds: 1));
     await secondRetry;
     await tester.pump(const Duration(minutes: 3));
-    expect(controller.fakePlayer.jumpedIndexes, [0, 0]);
+    expect(controller.fakePlayer.selectedIndexes, [0, 0]);
     expect(controller.mediaErrorRetryCount, 2);
     await completePlayback(controller);
     await tester.pump(const Duration(minutes: 3));
 
-    expect(controller.fakePlayer.jumpedIndexes, [0, 0]);
+    expect(controller.fakePlayer.selectedIndexes, [0, 0]);
     expect(controller.fakePlayer.openedPlaylists, hasLength(2));
     expect(controller.fakePlayer.stopCalls, 0);
     expect(controller.mediaErrorRetryCount, 3);
@@ -1427,7 +1473,7 @@ void main() {
     await completePlayback(controller);
 
     expect(controller.mediaErrorRetryCount, 1);
-    expect(controller.fakePlayer.jumpedIndexes, [0]);
+    expect(controller.fakePlayer.selectedIndexes, [0]);
     expect(controller.fakePlayer.stopCalls, 0);
     expect(site.detailRequests, 1);
     expect(site.urlRequests, 1);
@@ -1573,9 +1619,14 @@ class _TestRoomController extends LiveRoomController {
 }
 
 class _TestPlayer extends Fake implements Player {
+  late final native = _TestNativePlayer(this);
+
+  @override
+  NativePlayer get platform => native;
+
   final openedUris = <String>[];
   final openedPlaylists = <Playlist>[];
-  final jumpedIndexes = <int>[];
+  final selectedIndexes = <int>[];
   Playlist currentPlaylist = const Playlist([]);
   bool playing = true;
   bool completed = false;
@@ -1584,7 +1635,7 @@ class _TestPlayer extends Fake implements Player {
   int stopCalls = 0;
   int disposeCalls = 0;
   void Function()? onOpen;
-  void Function()? onJump;
+  void Function()? onSelect;
   void Function()? onStop;
 
   @override
@@ -1611,13 +1662,17 @@ class _TestPlayer extends Fake implements Player {
 
   @override
   Future<void> jump(int index) async {
-    jumpedIndexes.add(index);
+    throw StateError('Live retries must not use jump/play/seek at EOF');
+  }
+
+  void selectLine(int index) {
+    selectedIndexes.add(index);
     currentPlaylist = Playlist(currentPlaylist.medias, index: index);
     playing = true;
     completed = false;
     buffering = false;
     position = Duration.zero;
-    onJump?.call();
+    onSelect?.call();
   }
 
   @override
@@ -1634,5 +1689,34 @@ class _TestPlayer extends Fake implements Player {
   @override
   Future<void> dispose() async {
     disposeCalls += 1;
+  }
+}
+
+class _TestNativePlayer extends Fake implements NativePlayer {
+  _TestNativePlayer(this.player);
+
+  final _TestPlayer player;
+  final commands = <List<String>>[];
+  final properties = <String, String>{};
+
+  @override
+  bool isPlayingStateChangeAllowed = false;
+
+  @override
+  Future<void> command(List<String> command,
+      {bool waitForInitialization = true}) async {
+    commands.add(List.of(command));
+    expectSync(command.first, 'playlist-play-index');
+    expectSync(isPlayingStateChangeAllowed, isTrue);
+    player.selectLine(int.parse(command[1]));
+  }
+
+  @override
+  Future<void> setProperty(String property, String value,
+      {bool waitForInitialization = true}) async {
+    properties[property] = value;
+    expectSync(property, 'pause');
+    expectSync(value, 'no');
+    player.playing = true;
   }
 }
