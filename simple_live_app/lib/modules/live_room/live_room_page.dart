@@ -107,7 +107,7 @@ class LiveRoomPage extends GetView<LiveRoomController> {
     return PiPSwitcher(
       floating: controller.pip,
       childWhenDisabled: page,
-      childWhenEnabled: buildMediaPlayer(),
+      childWhenEnabled: buildMediaPlayer(inPictureInPicture: true),
     );
   }
 
@@ -238,7 +238,7 @@ class LiveRoomPage extends GetView<LiveRoomController> {
     );
   }
 
-  Widget buildMediaPlayer() {
+  Widget buildMediaPlayer({bool inPictureInPicture = false}) {
     var boxFit = BoxFit.contain;
     double? aspectRatio;
     if (AppSettingsController.instance.scaleMode.value == 0) {
@@ -264,7 +264,11 @@ class LiveRoomPage extends GetView<LiveRoomController> {
           resumeUponEnteringForegroundMode:
               AppSettingsController.instance.playerAutoPause.value,
           controls: (state) {
-            return playerControls(state, controller);
+            return playerControls(
+              state,
+              controller,
+              inPictureInPicture: inPictureInPicture,
+            );
           },
           aspectRatio: aspectRatio,
           fit: boxFit,

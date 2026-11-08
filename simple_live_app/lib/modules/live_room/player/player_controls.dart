@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
@@ -10,6 +11,7 @@ import 'package:simple_live_app/app/controller/app_settings_controller.dart';
 import 'package:simple_live_app/app/sites.dart';
 import 'package:simple_live_app/app/utils.dart';
 import 'package:simple_live_app/modules/live_room/live_room_controller.dart';
+import 'package:simple_live_app/modules/live_room/player/player_status_bar.dart';
 import 'package:simple_live_app/modules/settings/danmu_settings_page.dart';
 import 'package:simple_live_app/services/follow_service.dart';
 import 'package:simple_live_app/widgets/desktop_refresh_button.dart';
@@ -21,13 +23,15 @@ import 'package:simple_live_core/simple_live_core.dart';
 
 Widget playerControls(
   VideoState videoState,
-  LiveRoomController controller,
-) {
+  LiveRoomController controller, {
+  bool inPictureInPicture = false,
+}) {
   return Obx(() {
     if (controller.fullScreenState.value) {
       return buildFullControls(
         videoState,
         controller,
+        inPictureInPicture: inPictureInPicture,
       );
     }
     return buildControls(
@@ -40,9 +44,18 @@ Widget playerControls(
 
 Widget buildFullControls(
   VideoState videoState,
-  LiveRoomController controller,
-) {
-  var padding = MediaQuery.of(videoState.context).padding;
+  LiveRoomController controller, {
+  bool inPictureInPicture = false,
+}) {
+  final padding = MediaQuery.of(videoState.context).viewPadding;
+  final showStatusBar =
+      (Platform.isAndroid || Platform.isIOS) && !inPictureInPicture;
+  final horizontalInset = math.max(padding.left, padding.right) + 12;
+  final toolbarHeight = showStatusBar ? 40.0 : 48.0;
+  final toolbarIconSize = showStatusBar ? 22.0 : 24.0;
+  final topBarHeight = toolbarHeight +
+      padding.top +
+      (showStatusBar ? PlayerStatusBar.height : 0);
   GlobalKey volumeButtonkey = GlobalKey();
   return DragToMoveArea(
     child: Stack(
@@ -125,13 +138,13 @@ Widget buildFullControls(
             top: (controller.showControlsState.value &&
                     !controller.lockControlsState.value)
                 ? 0
-                : -(48 + padding.top),
+                : -topBarHeight,
             duration: const Duration(milliseconds: 200),
             child: Container(
-              height: 48 + padding.top,
+              height: topBarHeight,
               padding: EdgeInsets.only(
-                left: padding.left + 12,
-                right: padding.right + 12,
+                left: horizontalInset,
+                right: horizontalInset,
                 top: padding.top,
               ),
               decoration: const BoxDecoration(
@@ -144,73 +157,87 @@ Widget buildFullControls(
                   ],
                 ),
               ),
-              child: Row(
+              child: Column(
                 children: [
-                  IconButton(
-                    onPressed: () {
-                      if (controller.smallWindowState.value) {
-                        controller.exitSmallWindow();
-                      } else {
-                        controller.exitFull();
-                      }
-                    },
-                    icon: const Icon(
-                      Icons.arrow_back,
-                      color: Colors.white,
-                      size: 24,
+                  if (showStatusBar)
+                    PlayerStatusBar(
+                      visible: controller.showControlsState.value &&
+                          !controller.lockControlsState.value,
                     ),
-                  ),
-                  AppStyle.hGap12,
                   Expanded(
-                    child: Text(
-                      "${controller.detail.value?.title} - ${controller.detail.value?.userName}",
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: Colors.white, fontSize: 16),
-                    ),
-                  ),
-                  AppStyle.hGap12,
-                  IconButton(
-                    onPressed: () {
-                      controller.saveScreenshot();
-                    },
-                    icon: const Icon(
-                      Icons.camera_alt_outlined,
-                      color: Colors.white,
-                      size: 24,
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: () {
-                      showFollowUser(controller);
-                    },
-                    icon: const Icon(
-                      Remix.play_list_2_line,
-                      color: Colors.white,
-                      size: 24,
-                    ),
-                  ),
-                  Visibility(
-                    visible: Platform.isAndroid,
-                    child: IconButton(
-                      onPressed: () {
-                        controller.enablePIP();
-                      },
-                      icon: const Icon(
-                        Icons.picture_in_picture,
-                        color: Colors.white,
-                        size: 24,
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: () {
-                      showPlayerSettings(controller);
-                    },
-                    icon: const Icon(
-                      Icons.more_horiz,
-                      color: Colors.white,
-                      size: 24,
+                    child: Row(
+                      children: [
+                        IconButton(
+                          onPressed: () {
+                            if (controller.smallWindowState.value) {
+                              controller.exitSmallWindow();
+                            } else {
+                              controller.exitFull();
+                            }
+                          },
+                          icon: Icon(
+                            Icons.arrow_back,
+                            color: Colors.white,
+                            size: toolbarIconSize,
+                          ),
+                        ),
+                        AppStyle.hGap12,
+                        Expanded(
+                          child: Text(
+                            "${controller.detail.value?.title} - ${controller.detail.value?.userName}",
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                            ),
+                          ),
+                        ),
+                        AppStyle.hGap12,
+                        IconButton(
+                          onPressed: () {
+                            controller.saveScreenshot();
+                          },
+                          icon: Icon(
+                            Icons.camera_alt_outlined,
+                            color: Colors.white,
+                            size: toolbarIconSize,
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () {
+                            showFollowUser(controller);
+                          },
+                          icon: Icon(
+                            Remix.play_list_2_line,
+                            color: Colors.white,
+                            size: toolbarIconSize,
+                          ),
+                        ),
+                        Visibility(
+                          visible: Platform.isAndroid,
+                          child: IconButton(
+                            onPressed: () {
+                              controller.enablePIP();
+                            },
+                            icon: Icon(
+                              Icons.picture_in_picture,
+                              color: Colors.white,
+                              size: toolbarIconSize,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () {
+                            showPlayerSettings(controller);
+                          },
+                          icon: Icon(
+                            Icons.more_horiz,
+                            color: Colors.white,
+                            size: toolbarIconSize,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ],

@@ -45,6 +45,7 @@ dependencies:
   #系统交互
   package_info_plus: ^9.0.0 #包信息
   device_info_plus: ^12.2.0 #设备信息
+  battery_plus: ^7.0.0 #电量信息
   url_launcher: ^6.3.2 #打开链接
   share_plus: ^12.0.1 #分享
   path_provider: ^2.1.5 #常用路径
