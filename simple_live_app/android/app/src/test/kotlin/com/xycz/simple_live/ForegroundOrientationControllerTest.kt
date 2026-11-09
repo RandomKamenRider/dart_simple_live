@@ -11,16 +11,15 @@ class ForegroundOrientationControllerTest {
     private val controller = ForegroundOrientationController(applied::add)
 
     @Test
-    fun incomingCallReleasesLandscapeBeforeActivityIsPaused() {
+    fun resumedPlaybackKeepsLandscapeUntilActivityIsPaused() {
         foreground()
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
 
-        // A call overlay can take focus without pausing the underlying Activity.
-        controller.updateWindowState(resumed = true, focused = false, inPictureInPicture = false)
-        assertEquals(SCREEN_ORIENTATION_UNSPECIFIED, applied.last())
+        // A floating app can take focus while the underlying Activity stays resumed.
+        controller.updateActivityState(resumed = true, inPictureInPicture = false)
+        assertEquals(SCREEN_ORIENTATION_USER_LANDSCAPE, applied.last())
 
-        controller.updateWindowState(resumed = false, focused = false, inPictureInPicture = false)
-        controller.updateWindowState(resumed = true, focused = false, inPictureInPicture = false)
+        controller.updateActivityState(resumed = false, inPictureInPicture = false)
         assertEquals(SCREEN_ORIENTATION_UNSPECIFIED, applied.last())
 
         foreground()
@@ -28,21 +27,21 @@ class ForegroundOrientationControllerTest {
     }
 
     @Test
-    fun pauseReleasesLandscapeEvenIfWindowStillReportsFocus() {
+    fun pauseReleasesLandscape() {
         foreground()
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
 
-        controller.updateWindowState(resumed = false, focused = true, inPictureInPicture = false)
+        controller.updateActivityState(resumed = false, inPictureInPicture = false)
 
         assertEquals(SCREEN_ORIENTATION_UNSPECIFIED, applied.last())
     }
 
     @Test
-    fun backgroundOrientationRequestsWaitForForegroundFocus() {
+    fun backgroundOrientationRequestsWaitForResume() {
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
         assertEquals(listOf(SCREEN_ORIENTATION_UNSPECIFIED), applied)
 
-        controller.updateWindowState(resumed = true, focused = false, inPictureInPicture = false)
+        controller.updateActivityState(resumed = false, inPictureInPicture = false)
         controller.requestOrientation(SCREEN_ORIENTATION_FULL_USER)
         assertEquals(listOf(SCREEN_ORIENTATION_UNSPECIFIED), applied)
 
@@ -54,7 +53,7 @@ class ForegroundOrientationControllerTest {
     fun leavingFullscreenDuringInterruptionDoesNotRestoreOldLandscape() {
         foreground()
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
-        controller.updateWindowState(resumed = true, focused = false, inPictureInPicture = false)
+        controller.updateActivityState(resumed = false, inPictureInPicture = false)
 
         controller.requestOrientation(SCREEN_ORIENTATION_FULL_USER)
         assertEquals(SCREEN_ORIENTATION_UNSPECIFIED, applied.last())
@@ -64,15 +63,15 @@ class ForegroundOrientationControllerTest {
     }
 
     @Test
-    fun pictureInPictureDoesNotLockTheCallingAppEvenWhenResumedAndFocused() {
+    fun pictureInPictureDoesNotLockTheCallingAppEvenWhenResumed() {
         foreground()
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
 
-        controller.updateWindowState(resumed = true, focused = true, inPictureInPicture = true)
+        controller.updateActivityState(resumed = true, inPictureInPicture = true)
         assertEquals(SCREEN_ORIENTATION_UNSPECIFIED, applied.last())
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
-        controller.updateWindowState(resumed = false, focused = false, inPictureInPicture = true)
-        controller.updateWindowState(resumed = true, focused = true, inPictureInPicture = true)
+        controller.updateActivityState(resumed = false, inPictureInPicture = true)
+        controller.updateActivityState(resumed = true, inPictureInPicture = true)
         assertEquals(SCREEN_ORIENTATION_UNSPECIFIED, applied.last())
 
         foreground()
@@ -80,13 +79,12 @@ class ForegroundOrientationControllerTest {
     }
 
     @Test
-    fun exitingPictureInPictureWithoutFocusCannotRestoreLandscape() {
+    fun exitingPictureInPictureWhilePausedCannotRestoreLandscape() {
         foreground()
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
-        controller.updateWindowState(resumed = false, focused = false, inPictureInPicture = true)
+        controller.updateActivityState(resumed = false, inPictureInPicture = true)
 
-        controller.updateWindowState(resumed = false, focused = false, inPictureInPicture = false)
-        controller.updateWindowState(resumed = true, focused = false, inPictureInPicture = false)
+        controller.updateActivityState(resumed = false, inPictureInPicture = false)
         assertEquals(SCREEN_ORIENTATION_UNSPECIFIED, applied.last())
 
         foreground()
@@ -99,8 +97,8 @@ class ForegroundOrientationControllerTest {
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
         foreground()
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
-        controller.updateWindowState(resumed = true, focused = false, inPictureInPicture = false)
-        controller.updateWindowState(resumed = false, focused = false, inPictureInPicture = false)
+        controller.updateActivityState(resumed = true, inPictureInPicture = false)
+        controller.updateActivityState(resumed = false, inPictureInPicture = false)
         controller.requestOrientation(SCREEN_ORIENTATION_USER_LANDSCAPE)
         foreground()
 
@@ -116,6 +114,6 @@ class ForegroundOrientationControllerTest {
     }
 
     private fun foreground() {
-        controller.updateWindowState(resumed = true, focused = true, inPictureInPicture = false)
+        controller.updateActivityState(resumed = true, inPictureInPicture = false)
     }
 }

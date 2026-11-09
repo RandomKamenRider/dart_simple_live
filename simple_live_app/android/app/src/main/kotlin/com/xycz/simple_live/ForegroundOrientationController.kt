@@ -14,14 +14,14 @@ internal class ForegroundOrientationController(
         applyCurrentOrientation()
     }
 
-    fun updateWindowState(resumed: Boolean, focused: Boolean, inPictureInPicture: Boolean) {
-        canApplyOrientation = resumed && focused && !inPictureInPicture
+    fun updateActivityState(resumed: Boolean, inPictureInPicture: Boolean) {
+        canApplyOrientation = resumed && !inPictureInPicture
         applyCurrentOrientation()
     }
 
     private fun applyCurrentOrientation() {
-        // Calls and overlays can inherit the underlying Activity's orientation.
-        // Keep Flutter's latest request, but yield control until we own the screen.
+        // Floating apps can take focus while this Activity is still visible and resumed.
+        // Yield only when paused or in PiP, keeping Flutter's fullscreen direction intact.
         val orientation = if (canApplyOrientation) {
             desiredOrientation
         } else {

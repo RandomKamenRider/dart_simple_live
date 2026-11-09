@@ -5,7 +5,6 @@ import io.flutter.embedding.android.FlutterActivity
 
 class MainActivity : FlutterActivity() {
     private var activityResumed = false
-    private var windowFocused = false
     private val foregroundOrientation = ForegroundOrientationController { orientation ->
         super.setRequestedOrientation(orientation)
     }
@@ -17,21 +16,13 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         activityResumed = true
-        windowFocused = hasWindowFocus()
         updateOrientation()
     }
 
     override fun onPause() {
         activityResumed = false
-        windowFocused = false
         updateOrientation()
         super.onPause()
-    }
-
-    override fun onWindowFocusChanged(hasFocus: Boolean) {
-        windowFocused = hasFocus
-        updateOrientation()
-        super.onWindowFocusChanged(hasFocus)
     }
 
     override fun onPictureInPictureModeChanged(
@@ -45,9 +36,8 @@ class MainActivity : FlutterActivity() {
     private fun updateOrientation(
         inPictureInPicture: Boolean = isInPictureInPictureMode,
     ) {
-        foregroundOrientation.updateWindowState(
+        foregroundOrientation.updateActivityState(
             resumed = activityResumed,
-            focused = windowFocused,
             inPictureInPicture = inPictureInPicture,
         )
     }
