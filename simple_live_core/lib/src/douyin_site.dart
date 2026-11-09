@@ -742,6 +742,14 @@ class DouyinSite implements LiveSite {
   }
 
   @override
+  Stream<LivePlayUrl> getPlayUrlUpdates({
+    required LiveRoomDetail detail,
+    required LivePlayQuality quality,
+  }) async* {
+    yield await getPlayUrls(detail: detail, quality: quality);
+  }
+
+  @override
   Future<LivePlayUrl> getPlayUrls({
     required LiveRoomDetail detail,
     required LivePlayQuality quality,

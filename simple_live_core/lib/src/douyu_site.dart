@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:simple_live_core/src/common/http_client.dart';
+import 'package:simple_live_core/src/common/core_log.dart';
 import 'package:simple_live_core/src/danmaku/douyu_danmaku.dart';
 import 'package:simple_live_core/src/interface/live_danmaku.dart';
 import 'package:simple_live_core/src/interface/live_site.dart';
@@ -134,18 +135,37 @@ class DouyuSite implements LiveSite {
   Future<LivePlayUrl> getPlayUrls({
     required LiveRoomDetail detail,
     required LivePlayQuality quality,
-  }) async {
+  }) => getPlayUrlUpdates(detail: detail, quality: quality).last;
+
+  @override
+  Stream<LivePlayUrl> getPlayUrlUpdates({
+    required LiveRoomDetail detail,
+    required LivePlayQuality quality,
+  }) async* {
     var args = detail.data.toString();
     var data = quality.data as DouyuPlayData;
-
-    List<String> urls = [];
+    final urls = <String>[];
+    Object? lastError;
+    StackTrace? lastStackTrace;
     for (var item in data.cdns) {
-      var url = await getPlayUrl(detail.roomId, args, data.rate, item);
-      if (url.isNotEmpty) {
-        urls.add(url);
+      try {
+        var url = await getPlayUrl(detail.roomId, args, data.rate, item);
+        if (url.isNotEmpty && !urls.contains(url)) {
+          urls.add(url);
+          yield LivePlayUrl(urls: List.unmodifiable(urls));
+        }
+      } catch (error, stackTrace) {
+        lastError = error;
+        lastStackTrace = stackTrace;
+        CoreLog.error(error);
       }
     }
-    return LivePlayUrl(urls: urls);
+    if (urls.isEmpty) {
+      if (lastError != null) {
+        Error.throwWithStackTrace(lastError, lastStackTrace!);
+      }
+      yield LivePlayUrl(urls: const []);
+    }
   }
 
   Future<String> getPlayUrl(

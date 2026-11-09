@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter/foundation.dart' show listEquals, mapEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
@@ -71,6 +72,8 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
   /// 线路数据
   RxList<String> playUrls = RxList<String>();
+  int _playUrlRevision = 0;
+  int _playUrlLookupToken = 0;
 
   Map<String, String>? playHeaders;
 
@@ -387,6 +390,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
   /// 加载直播间信息
   Future<void> loadData() async {
+    _playUrlLookupToken += 1;
     _resetPlaybackRecovery();
     final generation = ++_streamOperationGeneration;
     _streamLoadGeneration = generation;
@@ -588,9 +592,17 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     _cancelPlaybackStabilityCheck();
     final quality = qualites[currentQuality];
     final previousLineIndex = currentLineIndex;
+    final lookupToken = ++_playUrlLookupToken;
+    final updates = StreamIterator(site.liveSite.getPlayUrlUpdates(
+      detail: detail.value!,
+      quality: quality,
+    ));
+    var fetchingBackups = false;
     try {
-      final playUrl = await site.liveSite
-          .getPlayUrls(detail: detail.value!, quality: quality);
+      if (!await updates.moveNext()) {
+        throw StateError("无法读取播放地址");
+      }
+      final playUrl = updates.current;
       if (!_isStreamOperationCurrent(generation)) {
         return;
       }
@@ -599,7 +611,8 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       }
 
       // 保留旧线路直到新地址就绪，避免结束事件把临时空列表误判为关播。
-      playUrls.value = playUrl.urls;
+      final revision = ++_playUrlRevision;
+      playUrls.value = List.of(playUrl.urls);
       playHeaders = playUrl.headers;
       currentQualityInfo.value = quality.quality;
       currentLineIndex = preserveLine &&
@@ -611,6 +624,10 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         mediaErrorRetryCount = 0;
       }
       await initPlaylist(operationGeneration: generation);
+      if (_isPlayUrlLookupCurrent(lookupToken, revision)) {
+        fetchingBackups = true;
+        unawaited(_appendPlayUrlUpdates(updates, lookupToken, revision));
+      }
     } catch (failure) {
       if (operationGeneration != null) {
         rethrow;
@@ -620,11 +637,83 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         errorMsg.value = "无法读取播放地址，请刷新重试";
       }
     } finally {
+      if (!fetchingBackups) {
+        // Cancellation must not hold the loading state while the stream unwinds.
+        unawaited(updates.cancel());
+      }
       if (operationGeneration == null && _streamLoadGeneration == generation) {
         _streamLoadGeneration = null;
         _checkPendingPlaybackFailure(generation);
       }
     }
+  }
+
+  Future<void> _appendPlayUrlUpdates(
+    StreamIterator<LivePlayUrl> updates,
+    int lookupToken,
+    int revision,
+  ) async {
+    try {
+      while (_isPlayUrlLookupCurrent(lookupToken, revision) &&
+          await updates.moveNext()) {
+        if (!_isPlayUrlLookupCurrent(lookupToken, revision)) {
+          return;
+        }
+        final update = updates.current;
+        if (update.urls.length < playUrls.length ||
+            !mapEquals(update.headers, playHeaders) ||
+            !listEquals(update.urls.take(playUrls.length).toList(), playUrls)) {
+          Log.d("忽略与当前播放列表不一致的备用线路");
+          return;
+        }
+        // Append under the same lock as open/stop/dispose. Never reopen the
+        // active stream when a backup arrives, including after a room change.
+        final appended = await NativePlayer.lock.synchronized(() async {
+          if (!_isPlayUrlLookupCurrent(lookupToken, revision) ||
+              !_matchesPlayUrls(player.state.playlist)) {
+            return false;
+          }
+          final native = player.platform as NativePlayer;
+          while (playUrls.length < update.urls.length) {
+            if (!_isPlayUrlLookupCurrent(lookupToken, revision)) {
+              return false;
+            }
+            final url = update.urls[playUrls.length];
+            await native.add(_playMedia(url), synchronized: false);
+            // add may finish after pause or a new selection. Keep the same
+            // installed list in sync, but never modify a replacement URL list.
+            if (_playUrlRevision != revision) {
+              return false;
+            }
+            playUrls.add(url);
+            if (!_isPlayUrlLookupCurrent(lookupToken, revision)) {
+              return false;
+            }
+          }
+          return true;
+        });
+        if (!appended) {
+          return;
+        }
+        syncPlayLine();
+      }
+    } catch (failure) {
+      // A failed backup must not turn healthy foreground playback into a reload.
+      if (_isPlayUrlLookupCurrent(lookupToken, revision)) {
+        Log.d("获取备用线路失败，保留当前播放：$failure");
+      }
+    } finally {
+      await updates.cancel();
+    }
+  }
+
+  bool _isPlayUrlLookupCurrent(int lookupToken, int revision) {
+    // Selecting or retrying an installed entry must not discard its backups.
+    return lookupToken == _playUrlLookupToken &&
+        revision == _playUrlRevision &&
+        !isBackground &&
+        !isClosed &&
+        !_playbackRecoveryStopped;
   }
 
   Future<void> changePlayLine(int index, {int? operationGeneration}) async {
@@ -1508,6 +1597,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       return;
     }
 
+    _playUrlLookupToken += 1;
     _cancelPlaybackRecovery();
     final generation = ++_streamOperationGeneration;
     _streamLoadGeneration = generation;
@@ -1550,6 +1640,7 @@ $_loadErrorStackTrace''');
     super.didChangeAppLifecycleState(state);
 
     if (state == AppLifecycleState.paused) {
+      _playUrlLookupToken += 1;
       Log.d("进入后台");
       //进入后台，关闭弹幕
       danmakuController?.clear();
@@ -1702,6 +1793,7 @@ $_loadErrorStackTrace''');
 
   @override
   void onClose() {
+    _playUrlLookupToken += 1;
     WidgetsBinding.instance.removeObserver(this);
     scrollController.removeListener(scrollListener);
     autoExitTimer?.cancel();

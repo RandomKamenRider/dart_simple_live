@@ -147,6 +147,246 @@ void main() {
     expect(site.urlRequests, 1);
   });
 
+  testWidgets('starts the first line before backups and appends without reload',
+      (tester) async {
+    const headers = {'Referer': 'https://platform.example/room'};
+    final backup = Completer<LivePlayUrl>();
+    final site = _TestLiveSite()
+      ..requestUrlUpdates = () async* {
+        yield LivePlayUrl(
+          urls: List.unmodifiable([_originalUrls.first]),
+          headers: headers,
+        );
+        yield await backup.future;
+      };
+    final controller = createController(site);
+
+    await controller.getPlayUrl();
+    expect(controller.fakePlayer.openedPlaylists.single.medias, hasLength(1));
+    expect(controller.playUrls, [_originalUrls.first]);
+    controller.fakePlayer.position = const Duration(seconds: 12);
+    controller.mediaErrorRetryCount = 2;
+
+    backup.complete(LivePlayUrl(urls: _originalUrls, headers: headers));
+    await tester.pump();
+
+    expect(controller.playUrls, _originalUrls);
+    expect(controller.fakePlayer.native.addedMedias.single.uri,
+        _originalUrls.last);
+    expect(
+        controller.fakePlayer.native.addedMedias.single.httpHeaders, headers);
+    expect(controller.fakePlayer.openedPlaylists, hasLength(1));
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
+    expect(controller.fakePlayer.position, const Duration(seconds: 12));
+    expect(controller.fakePlayer.buffering, isFalse);
+    expect(controller.mediaErrorRetryCount, 2);
+    expect(controller.errorMsg.value, isEmpty);
+    expect(site.urlRequests, 1);
+  });
+
+  testWidgets('backup lookup failures preserve the active stream',
+      (tester) async {
+    final backup = Completer<LivePlayUrl>();
+    final site = _TestLiveSite()
+      ..requestUrlUpdates = () async* {
+        yield LivePlayUrl(urls: [_originalUrls.first]);
+        yield await backup.future;
+      };
+    final controller = createController(site);
+    await controller.getPlayUrl();
+
+    backup.completeError(StateError('backup CDN unavailable'));
+    await tester.pump();
+
+    expect(controller.playUrls, [_originalUrls.first]);
+    expect(controller.fakePlayer.openedPlaylists, hasLength(1));
+    expect(controller.fakePlayer.native.addedMedias, isEmpty);
+    expect(controller.errorMsg.value, isEmpty);
+    expect(controller.mediaErrorRetryCount, 0);
+  });
+
+  for (final action in ['refresh', 'background', 'close']) {
+    testWidgets('late backup after $action cannot alter playback',
+        (tester) async {
+      final backup = Completer<LivePlayUrl>();
+      final site = _TestLiveSite()
+        ..requestUrlUpdates = () async* {
+          yield LivePlayUrl(urls: [_originalUrls.first]);
+          yield await backup.future;
+        };
+      final controller = createController(site);
+      await controller.getPlayUrl();
+
+      switch (action) {
+        case 'refresh':
+          site.requestUrlUpdates = null;
+          await controller.getPlayUrl();
+        case 'background':
+          controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+        case 'close':
+          controller.onDelete();
+      }
+      backup.complete(LivePlayUrl(urls: _originalUrls));
+      await tester.pump();
+
+      expect(controller.fakePlayer.native.addedMedias, isEmpty);
+      expect(controller.playUrls,
+          action == 'refresh' ? _refreshedUrls : [_originalUrls.first]);
+    });
+  }
+
+  for (final action in ['selection', 'retry']) {
+    testWidgets('pending backups survive a same-list $action', (tester) async {
+      final backup = Completer<LivePlayUrl>();
+      final site = _TestLiveSite()
+        ..requestUrlUpdates = () async* {
+          yield LivePlayUrl(urls: [_originalUrls.first]);
+          yield await backup.future;
+        };
+      final controller = createController(site);
+      await controller.getPlayUrl();
+
+      if (action == 'selection') {
+        await controller.changePlayLine(0);
+      } else {
+        await completePlayback(controller);
+      }
+      backup.complete(LivePlayUrl(urls: _originalUrls));
+      await tester.pump();
+
+      expect(controller.playUrls, _originalUrls);
+      expect(controller.fakePlayer.native.addedMedias, hasLength(1));
+      expect(controller.fakePlayer.openedPlaylists, hasLength(1));
+      expect(controller.fakePlayer.selectedIndexes, [0]);
+      expect(controller.currentLineIndex, 0);
+      expect(controller.mediaErrorRetryCount, action == 'retry' ? 1 : 0);
+      expect(site.urlRequests, 1);
+
+      await controller.changePlayLine(1);
+      expect(controller.fakePlayer.selectedIndexes, [0, 1]);
+      expect(controller.fakePlayer.openedPlaylists, hasLength(1));
+    });
+  }
+
+  testWidgets('a pending URL refresh invalidates the old backup lookup',
+      (tester) async {
+    final backup = Completer<LivePlayUrl>();
+    final refreshed = Completer<LivePlayUrl>();
+    final site = _TestLiveSite()
+      ..requestUrlUpdates = () async* {
+        yield LivePlayUrl(urls: [_originalUrls.first]);
+        yield await backup.future;
+      };
+    final controller = createController(site);
+    await controller.getPlayUrl();
+
+    site.requestUrlUpdates = null;
+    site.requestUrls = () => refreshed.future;
+    final refresh = controller.getPlayUrl();
+    backup.complete(LivePlayUrl(urls: _originalUrls));
+    await tester.pump();
+
+    expect(controller.fakePlayer.native.addedMedias, isEmpty);
+    expect(controller.playUrls, [_originalUrls.first]);
+    refreshed.complete(LivePlayUrl(urls: _refreshedUrls));
+    await refresh;
+    expect(controller.playUrls, _refreshedUrls);
+  });
+
+  testWidgets('a quick resume cannot revive a backgrounded backup lookup',
+      (tester) async {
+    final backup = Completer<LivePlayUrl>();
+    final site = _TestLiveSite()
+      ..requestUrlUpdates = () async* {
+        yield LivePlayUrl(urls: [_originalUrls.first]);
+        yield await backup.future;
+      };
+    final controller = createController(site);
+    await controller.getPlayUrl();
+
+    controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+    controller.didChangeAppLifecycleState(AppLifecycleState.resumed);
+    backup.complete(LivePlayUrl(urls: _originalUrls));
+    await tester.pump();
+
+    expect(controller.fakePlayer.native.addedMedias, isEmpty);
+    expect(controller.playUrls, [_originalUrls.first]);
+    expect(controller.fakePlayer.openedPlaylists, hasLength(1));
+    expect(site.urlRequests, 1);
+  });
+
+  testWidgets('a late backup cannot resume an exhausted retry budget',
+      (tester) async {
+    final backup = Completer<LivePlayUrl>();
+    final site = _TestLiveSite()
+      ..requestUrlUpdates = () async* {
+        yield LivePlayUrl(urls: [_originalUrls.first]);
+        yield await backup.future;
+      };
+    final controller = createController(site);
+    await controller.getPlayUrl();
+    controller.mediaErrorRetryCount = 3;
+    await completePlayback(controller);
+
+    backup.complete(LivePlayUrl(urls: _originalUrls));
+    await tester.pump();
+
+    expect(controller.fakePlayer.native.addedMedias, isEmpty);
+    expect(controller.fakePlayer.openedPlaylists, hasLength(1));
+    expect(controller.fakePlayer.selectedIndexes, isEmpty);
+    expect(controller.fakePlayer.stopCalls, 1);
+    expect(controller.mediaErrorRetryCount, 3);
+    expect(controller.errorMsg.value, contains('手动刷新'));
+  });
+
+  testWidgets('an appended backup remains selectable through playlist retry',
+      (tester) async {
+    final site = _TestLiveSite()
+      ..requestUrlUpdates = () async* {
+        yield LivePlayUrl(urls: [_originalUrls.first]);
+        yield LivePlayUrl(urls: _originalUrls);
+        yield LivePlayUrl(urls: _originalUrls);
+      };
+    final controller = createController(site);
+    await controller.getPlayUrl();
+    await tester.pump();
+
+    expect(controller.fakePlayer.native.addedMedias, hasLength(1));
+    await controller.changePlayLine(1);
+    await completePlayback(controller);
+
+    expect(controller.fakePlayer.selectedIndexes, [1, 1]);
+    expect(controller.fakePlayer.openedPlaylists, hasLength(1));
+    expect(controller.currentLineIndex, 1);
+    expect(controller.mediaErrorRetryCount, 1);
+  });
+
+  testWidgets('backgrounding during native append keeps both lists consistent',
+      (tester) async {
+    final backup = Completer<LivePlayUrl>();
+    final append = Completer<void>();
+    final site = _TestLiveSite()
+      ..requestUrlUpdates = () async* {
+        yield LivePlayUrl(urls: [_originalUrls.first]);
+        yield await backup.future;
+      };
+    final controller = createController(site);
+    await controller.getPlayUrl();
+    controller.fakePlayer.native.appendWait = append;
+    backup.complete(LivePlayUrl(urls: _originalUrls));
+    await tester.pump();
+    expect(controller.fakePlayer.native.addedMedias, hasLength(1));
+
+    controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+    append.complete();
+    await tester.pump();
+
+    expect(controller.playUrls, _originalUrls);
+    expect(controller.fakePlayer.currentPlaylist.medias.map((item) => item.uri),
+        _originalUrls);
+    expect(controller.fakePlayer.openedPlaylists, hasLength(1));
+  });
+
   testWidgets('native playlist advancement preserves the pending retry budget',
       (tester) async {
     final site = _TestLiveSite();
@@ -1560,9 +1800,26 @@ class _TestLiveSite extends LiveSite {
   final urlQualities = <LivePlayQuality>[];
   Future<LivePlayUrl> Function() requestUrls =
       () async => LivePlayUrl(urls: _refreshedUrls);
+  Stream<LivePlayUrl> Function()? requestUrlUpdates;
   Future<LiveRoomDetail> Function() requestDetail = () async => _roomDetail();
   Future<List<LivePlayQuality>> Function() requestQualities =
       () async => [_quality(signature: 'new')];
+
+  @override
+  Stream<LivePlayUrl> getPlayUrlUpdates({
+    required LiveRoomDetail detail,
+    required LivePlayQuality quality,
+  }) async* {
+    final updates = requestUrlUpdates;
+    if (updates == null) {
+      yield await getPlayUrls(detail: detail, quality: quality);
+    } else {
+      urlRequests += 1;
+      urlDetails.add(detail);
+      urlQualities.add(quality);
+      yield* updates();
+    }
+  }
 
   @override
   Future<LivePlayUrl> getPlayUrls({
@@ -1698,6 +1955,19 @@ class _TestNativePlayer extends Fake implements NativePlayer {
   final _TestPlayer player;
   final commands = <List<String>>[];
   final properties = <String, String>{};
+  final addedMedias = <Media>[];
+  Completer<void>? appendWait;
+
+  @override
+  Future<void> add(Media media, {bool synchronized = true}) async {
+    expectSync(synchronized, isFalse);
+    addedMedias.add(media);
+    player.currentPlaylist = Playlist(
+      [...player.currentPlaylist.medias, media],
+      index: player.currentPlaylist.index,
+    );
+    await appendWait?.future;
+  }
 
   @override
   bool isPlayingStateChangeAllowed = false;

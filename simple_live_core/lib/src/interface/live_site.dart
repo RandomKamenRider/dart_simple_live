@@ -77,6 +77,14 @@ class LiveSite {
     return Future.value(LivePlayUrl(urls: []));
   }
 
+  /// 按可用顺序返回累计播放地址，首条地址无需等待备用线路。
+  Stream<LivePlayUrl> getPlayUrlUpdates({
+    required LiveRoomDetail detail,
+    required LivePlayQuality quality,
+  }) async* {
+    yield await getPlayUrls(detail: detail, quality: quality);
+  }
+
   /// 查询直播状态
   Future<bool> getLiveStatus({required String roomId}) {
     return Future.value(false);

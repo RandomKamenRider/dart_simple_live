@@ -208,21 +208,42 @@ class HuyaSite implements LiveSite {
   }
 
   @override
-  Future<LivePlayUrl> getPlayUrls(
-      {required LiveRoomDetail detail,
-      required LivePlayQuality quality}) async {
-    var ls = <String>[];
+  Future<LivePlayUrl> getPlayUrls({
+    required LiveRoomDetail detail,
+    required LivePlayQuality quality,
+  }) => getPlayUrlUpdates(detail: detail, quality: quality).last;
+
+  @override
+  Stream<LivePlayUrl> getPlayUrlUpdates({
+    required LiveRoomDetail detail,
+    required LivePlayQuality quality,
+  }) async* {
+    final urls = <String>[];
+    Object? lastError;
+    StackTrace? lastStackTrace;
     for (var element in quality.data["urls"]) {
-      var line = element as HuyaLineModel;
-      var url = await getPlayUrl(line, quality.data["bitRate"]);
-      ls.add(url);
+      try {
+        var line = element as HuyaLineModel;
+        var url = await getPlayUrl(line, quality.data["bitRate"]);
+        if (url.isNotEmpty && !urls.contains(url)) {
+          urls.add(url);
+          yield LivePlayUrl(
+            urls: List.unmodifiable(urls),
+            headers: {"user-agent": HYSDK_UA},
+          );
+        }
+      } catch (error, stackTrace) {
+        lastError = error;
+        lastStackTrace = stackTrace;
+        CoreLog.error(error);
+      }
     }
-    // 最新UA需要额外验证，此方法暂时弃用
-    // var ua = await getHuYaUA();
-    return LivePlayUrl(
-      urls: ls,
-      headers: {"user-agent": HYSDK_UA},
-    );
+    if (urls.isEmpty) {
+      if (lastError != null) {
+        Error.throwWithStackTrace(lastError, lastStackTrace!);
+      }
+      yield LivePlayUrl(urls: const [], headers: {"user-agent": HYSDK_UA});
+    }
   }
 
   Future<String> getPlayUrl(HuyaLineModel line, int bitRate) async {
